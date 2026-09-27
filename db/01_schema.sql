@@ -25,6 +25,7 @@ $$;
 DROP VIEW IF EXISTS la_spatial_unit_v CASCADE;
 DROP TABLE IF EXISTS la_rrr, la_ba_unit_member, la_ba_unit, la_spatial_unit,
                      la_party,
+                     ulpin_lineage, infra_parcel_link, air_rights_volume,
                      conflict, utility, unit, floor, building, survey_parcel,
                      parcel, projects CASCADE;
 
@@ -100,10 +101,33 @@ VALUES ('siripuram', 'Siripuram, Visakhapatnam',
         'AP', 'VSP', 'ready', '2026-09-01T04:49:47Z');
 
 -- ---------------------------------------------------------------- parcel
+-- ulpin3d / ulpin14 / legacy_id: see the "3D ULPIN" section near the foot of
+-- this file for what these mean and why they sit alongside `ulpin` rather
+-- than replacing it. Added here (and on building/floor/unit/survey_parcel
+-- below) so a FRESH volume already has them; db/migrations/002_ulpin3d.sql
+-- adds the identical columns to an EXISTING one.
 CREATE TABLE parcel (
   id         integer PRIMARY KEY,
   project_id integer NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   ulpin      text UNIQUE NOT NULL,
+  -- The pre-3D-ULPIN identifier, exposed under its own name so a bookmark, a
+  -- printed deed or flat-register.json's key space keeps resolving even after
+  -- ulpin3d becomes the identifier this application mints and displays.
+  -- GENERATED rather than written by the pipeline, so it can never drift from
+  -- `ulpin` -- the two are the same value by construction, not by convention.
+  legacy_id  text GENERATED ALWAYS AS (ulpin) STORED,
+  ulpin3d    text UNIQUE,
+  -- 14-char synthetic ULPIN: state(2) + district(2) + geohash10(centroid).
+  -- GEOMETRY-DERIVED, unlike `ulpin` -- it cannot be recomputed from a bare
+  -- ordinal, so it is minted once (scripts/build_geometry.sql) and stored.
+  ulpin14           text UNIQUE,
+  ulpin14_source    text NOT NULL DEFAULT 'synthetic'
+                    CHECK (ulpin14_source IN ('synthetic','official')),
+  -- Where a real 14-digit ULPIN drops in later, without changing any child
+  -- identifier's structure -- only which string sits in ulpin14.
+  ulpin14_official  text,
+  status     text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  retired_at timestamptz,
   geom       geometry(Polygon, 4326) NOT NULL,
   area_m2    double precision NOT NULL,
   owner      text NOT NULL
@@ -163,6 +187,13 @@ CREATE TABLE survey_parcel (
   -- no issuing authority for a Voronoi cell.
   source         text,
   source_date    date,
+  -- Its OWN synthetic ULPIN14, from its own centroid -- survey_parcel is a
+  -- distinct cadastral layer from parcel, so it mints one rather than
+  -- borrowing the curtilage parcel's.
+  ulpin3d           text UNIQUE,
+  ulpin14           text UNIQUE,
+  ulpin14_source    text NOT NULL DEFAULT 'synthetic'
+                    CHECK (ulpin14_source IN ('synthetic','official')),
   geom           geometry(Polygon, 4326) NOT NULL,
   UNIQUE (project_id, label),
   -- A derived row cannot carry a survey number, and a survey row must say
@@ -188,6 +219,10 @@ CREATE TABLE building (
   -- placed somewhere arbitrary. ON DELETE SET NULL for the same reason.
   survey_parcel_id integer REFERENCES survey_parcel(id) ON DELETE SET NULL,
   ulpin         text UNIQUE NOT NULL,
+  legacy_id     text GENERATED ALWAYS AS (ulpin) STORED,
+  ulpin3d       text UNIQUE,
+  status        text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  retired_at    timestamptz,
   footprint     geometry(Polygon, 4326) NOT NULL,
   height_m      double precision NOT NULL,
   floors        integer NOT NULL,
@@ -227,6 +262,11 @@ CREATE TABLE floor (
   id            integer PRIMARY KEY,
   building_id   integer NOT NULL REFERENCES building(id) ON DELETE CASCADE,
   ulpin         text UNIQUE NOT NULL,
+  legacy_id     text GENERATED ALWAYS AS (ulpin) STORED,
+  ulpin3d       text UNIQUE,
+  status        text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  retired_at    timestamptz,
+  vertical_datum text NOT NULL DEFAULT 'placeholder',
   level_no      integer NOT NULL,          -- negative = basement, 0 = ground
   z_min         double precision NOT NULL,
   z_max         double precision NOT NULL,
@@ -241,6 +281,14 @@ CREATE TABLE unit (
   id          integer PRIMARY KEY,
   floor_id    integer NOT NULL REFERENCES floor(id) ON DELETE CASCADE,
   ulpin       text UNIQUE NOT NULL,
+  legacy_id   text GENERATED ALWAYS AS (ulpin) STORED,
+  ulpin3d     text UNIQUE,
+  -- Never reused: a split/merge retires this row (status='retired',
+  -- retired_at set) and mints new child ids in ulpin_lineage rather than
+  -- renumbering or deleting it. See db/migrations/002_ulpin3d.sql.
+  status      text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  retired_at  timestamptz,
+  vertical_datum text NOT NULL DEFAULT 'placeholder',
   unit_no     text NOT NULL,
   geom_3d     geometry(PolyhedralSurfaceZ, 4326) NOT NULL,
   z_min       double precision NOT NULL,
@@ -280,14 +328,22 @@ CREATE TABLE unit (
 CREATE TABLE utility (
   id          integer PRIMARY KEY,
   project_id  integer NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  -- Widened by migration 004; a fresh volume must start where that left off,
-  -- or seeding a telecom/drainage/foundation run fails the CHECK.
+  -- Widened by migration 004 (telecom/drainage/foundation) and migration
+  -- 002_ulpin3d (gas); a fresh volume must start where that left off.
   asset_type  text NOT NULL CHECK (asset_type IN ('water','sewer','power','metro',
-                                                  'telecom','drainage','foundation')),
+                                                  'telecom','drainage','foundation','gas')),
   geom_3d     geometry(LineStringZ, 4326) NOT NULL,  -- centreline, drawn as a PolylineVolume
   envelope_3d geometry(PolyhedralSurfaceZ, 4326),    -- solid corridor, used for 3D conflict tests
   depth_m     double precision NOT NULL,             -- negative = below ground
   radius_m    double precision NOT NULL,
+  vertical_datum text NOT NULL DEFAULT 'placeholder',
+  -- The INF-rooted identifier (infra_fmt()), minted only for corridor types
+  -- that cross more than one parcel -- NOT for 'foundation', which is
+  -- building-scoped. NULL for a foundation run, and for any run minted before
+  -- this migration until the pipeline re-seeds.
+  infra_id       text UNIQUE,
+  infra_type     text CHECK (infra_type IN ('SWR','WTR','GAS','ELC','TEL','MTR','ELV')),
+  infra_serial   int,
   authority   text NOT NULL,
   status      text NOT NULL DEFAULT 'operational',
   -- Set on a run that serves ONE building rather than a street: the demo
@@ -315,6 +371,59 @@ CREATE TABLE conflict (
   b_type      text    NOT NULL,
   kind        text    NOT NULL,
   detected_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ------------------------------------------------------- air_rights_volume
+-- A volume above the permitted building envelope that belongs to no single
+-- building -- LEVEL code X01-X09 in the 3D-ULPIN grammar, attached directly
+-- to the parcel (no building segment). Demonstration envelopes only until a
+-- real permitted-envelope calculation exists: see scripts/build_geometry.sql.
+CREATE TABLE air_rights_volume (
+  id             integer PRIMARY KEY,
+  project_id     integer NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  parcel_id      integer NOT NULL REFERENCES parcel(id) ON DELETE CASCADE,
+  index_no       int NOT NULL CHECK (index_no BETWEEN 1 AND 9),
+  z_min          double precision NOT NULL,
+  z_max          double precision NOT NULL,
+  vertical_datum text NOT NULL DEFAULT 'placeholder',
+  ulpin3d        text UNIQUE NOT NULL,
+  status         text NOT NULL DEFAULT 'active' CHECK (status IN ('active','retired')),
+  retired_at     timestamptz,
+  provenance     text NOT NULL DEFAULT 'estimated'
+                 CHECK (provenance IN ('surveyed','derived','estimated')),
+  note           text,
+  UNIQUE (parcel_id, index_no)
+);
+
+-- ------------------------------------------------------- infra_parcel_link
+-- Every parcel a cross-parcel infrastructure segment passes under or over --
+-- an easement or restriction recorded once here rather than resolved by a
+-- live spatial join on every request. Populated by scripts/utilities.sql via
+-- ST_Intersects(utility.envelope_3d, parcel.geom).
+CREATE TABLE infra_parcel_link (
+  id             serial PRIMARY KEY,
+  infra_id       text NOT NULL,
+  ulpin14        text NOT NULL,
+  rrr_type       text NOT NULL CHECK (rrr_type IN ('easement','restriction')),
+  z_min          double precision NOT NULL,
+  z_max          double precision NOT NULL,
+  vertical_datum text NOT NULL DEFAULT 'placeholder',
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (infra_id, ulpin14)
+);
+
+-- ------------------------------------------------------------ ulpin_lineage
+-- IDs are never reused. Splitting or merging a unit retires the parent
+-- (status='retired', retired_at set on the source table) and mints new child
+-- ids; this table is the paper trail linking parent to children. Written by
+-- POST /api/p/:slug/unit/:id/split (lib/api/handlers.ts unitSplitRoute).
+CREATE TABLE ulpin_lineage (
+  id         serial PRIMARY KEY,
+  project_id integer REFERENCES projects(id) ON DELETE CASCADE,
+  parent_id  text NOT NULL,
+  child_id   text NOT NULL,
+  event      text NOT NULL CHECK (event IN ('split','merge','renumber')),
+  event_date timestamptz NOT NULL DEFAULT now()
 );
 
 -- ===========================================================================
@@ -410,8 +519,12 @@ CREATE TABLE la_ba_unit (
 CREATE TABLE la_spatial_unit (
   su_id       text PRIMARY KEY,
   project_id  integer NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- 'air_rights' added for air_rights_volume rows (see below). The header
+  -- comment's "two kinds have no ULPIN" is now stale for air rights in this
+  -- cadastre specifically -- an air-rights volume DOES carry a 3D ULPIN
+  -- (LEVEL code X01-X09) -- but stays true for utility corridors.
   source_kind text NOT NULL
-              CHECK (source_kind IN ('parcel','survey_parcel','unit','utility')),
+              CHECK (source_kind IN ('parcel','survey_parcel','unit','utility','air_rights')),
   source_id   integer NOT NULL,
   su_type     text NOT NULL
               CHECK (su_type IN ('surface','multi_storey','subterranean','air_rights')),
@@ -512,6 +625,13 @@ CREATE INDEX utility_geom_gix   ON utility  USING gist (geom_3d);
 CREATE INDEX utility_env_gix    ON utility  USING gist (envelope_3d);
 CREATE INDEX utility_building_ix ON utility (building_id) WHERE building_id IS NOT NULL;
 
+CREATE INDEX air_rights_project_ix  ON air_rights_volume (project_id);
+CREATE INDEX air_rights_parcel_ix   ON air_rights_volume (parcel_id);
+CREATE INDEX infra_link_infra_ix    ON infra_parcel_link (infra_id);
+CREATE INDEX infra_link_ulpin14_ix  ON infra_parcel_link (ulpin14);
+CREATE INDEX ulpin_lineage_parent_ix ON ulpin_lineage (parent_id);
+CREATE INDEX ulpin_lineage_child_ix  ON ulpin_lineage (child_id);
+
 CREATE INDEX la_party_project_ix   ON la_party (project_id);
 CREATE INDEX la_ba_unit_project_ix ON la_ba_unit (project_id);
 CREATE INDEX la_su_project_ix      ON la_spatial_unit (project_id);
@@ -558,9 +678,12 @@ SELECT s.su_id,
        s.z_max,
        s.volume_m3,
        s.provenance,
-       COALESCE(u.geom_3d, ut.envelope_3d, ut.geom_3d, p.geom, sp.geom) AS geom_3d
+       COALESCE(u.geom_3d, ut.envelope_3d, ut.geom_3d, p.geom, sp.geom,
+                make_prism(ap.geom, ar.z_min, ar.z_max)) AS geom_3d
   FROM la_spatial_unit s
-  LEFT JOIN unit          u  ON s.source_kind = 'unit'          AND u.id  = s.source_id
-  LEFT JOIN utility       ut ON s.source_kind = 'utility'       AND ut.id = s.source_id
-  LEFT JOIN parcel        p  ON s.source_kind = 'parcel'        AND p.id  = s.source_id
-  LEFT JOIN survey_parcel sp ON s.source_kind = 'survey_parcel' AND sp.id = s.source_id;
+  LEFT JOIN unit             u  ON s.source_kind = 'unit'          AND u.id  = s.source_id
+  LEFT JOIN utility          ut ON s.source_kind = 'utility'       AND ut.id = s.source_id
+  LEFT JOIN parcel           p  ON s.source_kind = 'parcel'        AND p.id  = s.source_id
+  LEFT JOIN survey_parcel    sp ON s.source_kind = 'survey_parcel' AND sp.id = s.source_id
+  LEFT JOIN air_rights_volume ar ON s.source_kind = 'air_rights'    AND ar.id = s.source_id
+  LEFT JOIN parcel           ap ON ap.id = ar.parcel_id;

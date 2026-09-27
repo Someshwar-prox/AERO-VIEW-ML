@@ -22,11 +22,11 @@
       },
       "created_at": "2026-09-01T04:49:47.000Z",
       "stats": {
-        "units": 6636,
+        "units": 6651,
         "floors": 1834,
         "parcels": 326,
         "streets": 131,
-        "buildings": 385,
+        "buildings": 387,
         "conflicts": 0,
         "utilities": 304,
         "survey_parcels": 325

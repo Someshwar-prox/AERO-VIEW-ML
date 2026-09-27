@@ -738,12 +738,20 @@ export default function DetailPanel() {
           ) : null}
 
           <div className="mt-2">
-            {/* The parcel-level identifier, on the card that carries the
-                disclaimer. Built with generate() rather than concatenated, so
-                it round-trips through parse() by construction -- which is what
+            {/* sp.ulpin3d is GEOMETRY-DERIVED (state+district+geohash of this
+                survey parcel's own centroid) and cannot be recomputed from the
+                bare label the way the old identifier can -- so this reads the
+                value the server already minted rather than calling a
+                generator. generate() is the fallback for a snapshot that has
+                not been re-seeded under the new scheme yet, and it stays
+                built with generate() rather than concatenated, so it
+                round-trips through parse() by construction -- which is what
                 scripts/check_gis2d.mjs asserts. */}
-            <UlpinCard ulpin={generate(Number(sp.label), undefined, undefined,
-              undefined, parcelCodes ?? undefined)} />
+            <UlpinCard
+              ulpin={sp.ulpin3d ?? generate(Number(sp.label), undefined, undefined,
+                undefined, parcelCodes ?? undefined)}
+              ulpin14Source={sp.ulpin14_source}
+            />
           </div>
 
           <div className="mt-2">
@@ -1252,7 +1260,9 @@ export default function DetailPanel() {
           title={unitTitle(unit)}
           kicker={isOwn ? 'Your flat' : kindInfo.kicker}
         >
-          {unit.ulpin ? <UlpinCard ulpin={unit.ulpin} /> : null}
+          {unit.ulpin ? (
+            <UlpinCard ulpin={unit.ulpin3d ?? unit.ulpin} legacyId={unit.legacy_id} />
+          ) : null}
 
           {/* Directly under the identifier it exports, so the two read as one
               thing: this is the ULPIN, and this is how you take it away. */}
@@ -1624,7 +1634,9 @@ export default function DetailPanel() {
           title={`Level ${levelLabel(floor.level_no, bprops.floors - 1)}`}
           kicker={basement ? 'Basement level' : 'Floor level'}
         >
-          {floor.ulpin ? <UlpinCard ulpin={floor.ulpin} /> : null}
+          {floor.ulpin ? (
+            <UlpinCard ulpin={floor.ulpin3d ?? floor.ulpin} legacyId={floor.legacy_id} />
+          ) : null}
           {basement && !underground ? (
             <p className="mt-2 text-[11px] leading-relaxed text-muted">
               Shown lifted above ground so the plan can be read. The ring
@@ -1785,7 +1797,9 @@ export default function DetailPanel() {
       }
     >
       <UnsavedBanner activeId={bprops.id} />
-      {bprops.ulpin ? <UlpinCard ulpin={bprops.ulpin} /> : null}
+      {bprops.ulpin ? (
+        <UlpinCard ulpin={bprops.ulpin3d ?? bprops.ulpin} legacyId={bprops.legacy_id} />
+      ) : null}
       {composition ? (
         <p className="mt-2 text-[11px] leading-snug text-[rgb(var(--muted))]">
           {composition}

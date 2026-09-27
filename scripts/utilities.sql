@@ -159,6 +159,65 @@ UPDATE utility u
  WHERE u.project_id = (SELECT project_id FROM seed_ctx);
 
 -- ---------------------------------------------------------------------------
+-- Cross-parcel infrastructure identifiers (INF-root) + parcel links.
+--
+-- Every asset type seeded above is a street run crossing many parcels -- the
+-- exact case the brief's INF- root exists for -- so all of them get one.
+-- 'foundation'-type utility rows (building-scoped, seeded elsewhere) do NOT:
+-- they belong to one building, not a corridor, and stay addressed by their
+-- numeric id only.
+-- ---------------------------------------------------------------------------
+WITH numbered AS (
+  SELECT id, asset_type,
+         row_number() OVER (PARTITION BY asset_type ORDER BY id) AS serial
+    FROM utility
+   WHERE project_id = (SELECT project_id FROM seed_ctx)
+     AND asset_type <> 'foundation'
+)
+UPDATE utility u
+   SET infra_type   = CASE n.asset_type
+                         WHEN 'water' THEN 'WTR' WHEN 'sewer'  THEN 'SWR'
+                         WHEN 'power' THEN 'ELC' WHEN 'metro'  THEN 'MTR'
+                         WHEN 'gas'   THEN 'GAS' WHEN 'telecom' THEN 'TEL'
+                         WHEN 'drainage' THEN 'SWR'
+                       END,
+       infra_serial = n.serial,
+       infra_id     = infra_fmt((SELECT state_code FROM seed_ctx),
+                                 (SELECT district_code FROM seed_ctx),
+                                 CASE n.asset_type
+                                   WHEN 'water' THEN 'WTR' WHEN 'sewer'  THEN 'SWR'
+                                   WHEN 'power' THEN 'ELC' WHEN 'metro'  THEN 'MTR'
+                                   WHEN 'gas'   THEN 'GAS' WHEN 'telecom' THEN 'TEL'
+                                   WHEN 'drainage' THEN 'SWR'
+                                 END,
+                                 n.serial)
+  FROM numbered n
+ WHERE u.id = n.id;
+
+-- Every parcel a run's corridor footprint passes under (or over). 2D
+-- footprint intersection is exact here: every corridor this pipeline builds
+-- is a vertical prism (make_prism), so a plan-view crossing is a real
+-- under/over-flight regardless of the parcel's own (unrecorded) vertical
+-- extent.
+DELETE FROM infra_parcel_link l
+ USING utility u
+ WHERE l.infra_id = u.infra_id AND u.project_id = (SELECT project_id FROM seed_ctx);
+
+INSERT INTO infra_parcel_link (infra_id, ulpin14, rrr_type, z_min, z_max, vertical_datum)
+SELECT DISTINCT u.infra_id, p.ulpin14,
+       CASE WHEN u.depth_m < 0 THEN 'easement' ELSE 'restriction' END,
+       (SELECT z0 FROM ground_ref) + u.depth_m - u.radius_m,
+       (SELECT z0 FROM ground_ref) + u.depth_m + u.radius_m,
+       'placeholder'
+  FROM utility u
+  JOIN parcel p ON p.project_id = (SELECT project_id FROM seed_ctx)
+                AND p.ulpin14 IS NOT NULL
+                AND ST_Intersects(ST_Force2D(u.envelope_3d), p.geom)
+ WHERE u.project_id = (SELECT project_id FROM seed_ctx)
+   AND u.infra_id IS NOT NULL
+ON CONFLICT (infra_id, ulpin14) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
 -- Conflicts: utility corridor vs basement slab.
 -- The && prefilter uses the 2D GIST indexes; ST_3DIntersects (SFCGAL) then does
 -- the exact test on the few surviving pairs. ST_MakeSolid matters: without it
@@ -202,6 +261,11 @@ SELECT asset_type, count(*), round(min(depth_m)::numeric,1) AS depth_m
 FROM utility
 WHERE project_id = (SELECT project_id FROM seed_ctx)
 GROUP BY 1 ORDER BY 1;
+
+\echo '--- infra_parcel_link (this project) ---'
+SELECT count(*) FROM infra_parcel_link l
+ JOIN parcel p ON p.ulpin14 = l.ulpin14
+WHERE p.project_id = (SELECT project_id FROM seed_ctx);
 
 \echo '--- conflicts ---'
 SELECT c.kind, u.asset_type, u.status, b.ulpin AS building_ulpin,

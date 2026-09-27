@@ -43,6 +43,10 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Runs under `npm run demo:seed` = `node --experimental-strip-types ...`, so
+// (unlike unitSlot() above, mirrored for a plain-node era of this script) the
+// 3D-ULPIN minting functions are imported directly rather than re-implemented.
+import { encode3D, mintUlpin14 } from '../lib/ulpin.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -286,6 +290,38 @@ function floorZ(levelNo) {
 
 const ULPIN_BASE = `${STATE}-${DISTRICT}-${SCHEME}-9999`;
 
+// The 3D ULPIN, alongside the legacy identifier above. ULPIN14 is minted from
+// this parcel's own centroid (CX, CY) -- geometry-derived, so it is computed
+// here once rather than reconstructed anywhere downstream.
+const ULPIN14 = mintUlpin14(STATE, DISTRICT, CX, CY);
+const PARCEL_ULPIN3D = encode3D({ ulpin14: ULPIN14 });
+const BUILDING_ULPIN3D = encode3D({ ulpin14: ULPIN14, building: 1 });
+
+/** LEVEL kind+n for a level_no, matching scripts/build_geometry.sql's mapping. */
+function level3D(levelNo) {
+  if (levelNo === 0) return { kind: 'ground' };
+  if (levelNo > 0) return { kind: 'floor', n: levelNo };
+  return { kind: 'basement', n: -levelNo };
+}
+
+/** Ulpin3DUnitKind for a unit.kind, matching db/02_functions.sql's grouping. */
+function unit3DKind(kind) {
+  if (kind === 'parking') return 'parking';
+  if (kind === 'flat' || kind === 'retail' || kind === 'anchor') return 'unit';
+  return 'common';
+}
+
+function floorUlpin3D(levelNo) {
+  return encode3D({ ulpin14: ULPIN14, building: 1, level: level3D(levelNo) });
+}
+
+function unitUlpin3D(levelNo, kind, ordinal) {
+  return encode3D({
+    ulpin14: ULPIN14, building: 1, level: level3D(levelNo),
+    unit: { kind: unit3DKind(kind), n: ordinal },
+  });
+}
+
 /**
  * The residential floors. Four flats on each, so a floor is a plate with
  * four distinct volumes on it rather than one slab -- which is the whole
@@ -403,6 +439,8 @@ const newBuilding = {
   properties: {
     id: BUILDING_ID,
     ulpin: `${ULPIN_BASE}-001`,
+    ulpin3d: BUILDING_ULPIN3D,
+    legacy_id: `${ULPIN_BASE}-001`,
     parcel_id: PARCEL_ID,
     height_m: ABOVE_GROUND,
     floors: 20,
@@ -431,6 +469,10 @@ const newParcel = {
   properties: {
     id: PARCEL_ID,
     ulpin: ULPIN_BASE,
+    ulpin3d: PARCEL_ULPIN3D,
+    ulpin14: ULPIN14,
+    ulpin14_source: 'synthetic',
+    legacy_id: ULPIN_BASE,
     area_m2: Math.round(FL * 111000 * FW * 111000 * 0.92), // 36 m × 28 m in m²
     owner: 'Sampath Estates Pvt Ltd',
   },
@@ -465,6 +507,7 @@ const unitIdBase = 990000;
 const floors = ALL_LEVELS.map((lvl, i) => ({
   id: floorIdBase + i,
   ulpin: `${ULPIN_BASE}-001-${lvl < 0 ? 'B' + -lvl : String(lvl).padStart(2, '0')}`,
+  ulpin3d: floorUlpin3D(lvl),
   level_no: lvl,
   z_min: floorZ(lvl)[0],
   z_max: floorZ(lvl)[1],
@@ -678,12 +721,20 @@ for (const lvl of FLAT_FLOORS) {
     const slotNo = idx + 1;
     const code = flatCode(lvl, slotNo);
     const ulpin = `${floorEntry.ulpin}-${code}`;
+    // The NEW format's unit ordinal is "the nth unit on this floor" (1-4
+    // here), not the storey-based display code -- UNIT is a fixed 3 digits
+    // (001-999) in the 3D-ULPIN grammar, and '2004' (level 20, slot 4)
+    // exceeds that. `code` stays the human-readable label (`unit_no`);
+    // `slotNo` is what the new identifier actually encodes.
+    const ulpin3d = unitUlpin3D(lvl, 'flat', slotNo);
     const reg = registerFor(lvl, slotNo, code, ulpin);
     flatRegister[reg.ulpin] = reg.entry;
     units.push({
       id: unitIdBase + unitCounter,
       floor_id: floorEntry.id,
       ulpin,
+      ulpin3d,
+      legacy_id: ulpin,
       unit_no: code,
       level_no: lvl,
       z_min: floorEntry.z_min,
@@ -760,6 +811,7 @@ function pushVolume({
   if (identity) {
     Object.assign(row, {
       ulpin: `${floorEntry.ulpin}-${unitSlot(kind, ordinal)}`,
+      ulpin3d: ordinal !== undefined ? unitUlpin3D(level, kind, ordinal) : undefined,
       // Carpet is the usable area; for a bay or a shaft it IS the enclosed
       // area, so the 0.72 factor the flats use does not apply.
       carpet_m2: Math.round(area * 10) / 10,
@@ -945,7 +997,10 @@ const LADM_SNAPSHOT = path.join(API, 'ladm.json');
   try { ladm = await readJson(LADM_SNAPSHOT); } catch { /* first export */ }
   const towerPrefix = `${ULPIN_BASE}-001-`;
   for (const k of Object.keys(ladm)) {
-    if (k.startsWith(towerPrefix)) delete ladm[k];
+    // Clears entries under BOTH the legacy prefix and this run's own
+    // BUILDING_ULPIN3D, so a re-run does not leave a stale entry under
+    // whichever id an earlier run keyed it by.
+    if (k.startsWith(towerPrefix) || k.startsWith(`${BUILDING_ULPIN3D}-`)) delete ladm[k];
   }
   const flatCount = units.filter((u) => u.kind === undefined || u.kind === 'flat').length;
   let seq = 0;
@@ -954,9 +1009,18 @@ const LADM_SNAPSHOT = path.join(API, 'ladm.json');
     seq += 1;
     const isFlat = u.kind === undefined || u.kind === 'flat';
     const label = u.label ?? u.unit_no;
+    // KEPT AS THE LEGACY ULPIN, deliberately, even though the deed now
+    // prints ulpin3d and points its QR code there. `su.su_id` here is also
+    // the key `flatRegister()` in lib/db.ts looks the register up by
+    // (`register[raw.su.su_id]`), and data/projects/siripuram/flat-register.json
+    // is still keyed by the legacy ulpin -- rekeying su_id without rekeying
+    // the register would silently drop every mortgage/tax/bill row from the
+    // LADM document. The entry is written under BOTH keys below so a reader
+    // reaching it via either identifier gets the same document.
+    const suId = u.ulpin;
     const entry = {
       su: {
-        su_id: u.ulpin,
+        su_id: suId,
         su_type: 'multi_storey',
         dimension: '3D',
         source_kind: 'unit',
@@ -975,17 +1039,18 @@ const LADM_SNAPSHOT = path.join(API, 'ladm.json');
     if (isFlat) {
       // Synthetic ids in the demo range, so they cannot collide with anything
       // the exporter issued for the 384 OSM buildings.
+      const plotId = PARCEL_ULPIN3D ?? ULPIN_BASE;
       entry.ba_unit = {
         ba_unit_id: 990000 + seq,
-        ba_ulpin: `${u.ulpin}-BA`,
+        ba_ulpin: `${suId}-BA`,
         name: `Flat ${u.unit_no}`,
         ba_type: 'condominium_unit',
         ulpin_14: null,
         members: [
-          { su_id: u.ulpin, member_role: 'principal', share_num: 1, share_den: 1,
+          { su_id: suId, member_role: 'principal', share_num: 1, share_den: 1,
             su_type: 'multi_storey', label },
-          { su_id: ULPIN_BASE, member_role: 'undivided_share', share_num: 1,
-            share_den: flatCount, su_type: 'surface', label: `Plot ${ULPIN_BASE}` },
+          { su_id: plotId, member_role: 'undivided_share', share_num: 1,
+            share_den: flatCount, su_type: 'surface', label: `Plot ${plotId}` },
         ],
       };
       entry.rrrs = [{
@@ -1008,7 +1073,10 @@ const LADM_SNAPSHOT = path.join(API, 'ladm.json');
         },
       }];
     }
-    ladm[u.ulpin] = entry;
+    ladm[suId] = entry;
+    // Also reachable by the NEW identifier -- same object, so a reader
+    // hitting either key sees byte-identical data.
+    if (u.ulpin3d && u.ulpin3d !== suId) ladm[u.ulpin3d] = entry;
   }
   await writeJson(LADM_SNAPSHOT, ladm);
 }
@@ -1252,24 +1320,40 @@ async function seedPostgis() {
     await client.query('DELETE FROM parcel WHERE id = $1', [PARCEL_ID]);
     await client.query('DELETE FROM utility WHERE id = ANY($1)', [[99001, 99002, 99003]]);
 
+    // Columns added by db/migrations/002_ulpin3d.sql. Applied here too, same
+    // reasoning as the migration 006 columns above: an existing volume must
+    // not need dropping and re-seeding just to accept this script's rows.
+    await client.query(`
+      ALTER TABLE parcel ADD COLUMN IF NOT EXISTS ulpin3d text,
+                         ADD COLUMN IF NOT EXISTS ulpin14 text,
+                         ADD COLUMN IF NOT EXISTS ulpin14_source text NOT NULL DEFAULT 'synthetic'`);
     await client.query(
-      `INSERT INTO parcel (id, ulpin, geom, area_m2, owner, project_id)
-       VALUES ($1,$2,ST_GeomFromEWKT($3),$4,$5,$6)`,
-      [PARCEL_ID, newParcel.properties.ulpin, ring2d(footprintRing),
+      'ALTER TABLE building ADD COLUMN IF NOT EXISTS ulpin3d text');
+    await client.query(
+      'ALTER TABLE floor ADD COLUMN IF NOT EXISTS ulpin3d text');
+    await client.query(
+      'ALTER TABLE unit ADD COLUMN IF NOT EXISTS ulpin3d text');
+
+    await client.query(
+      `INSERT INTO parcel (id, ulpin, ulpin3d, ulpin14, ulpin14_source, geom, area_m2, owner, project_id)
+       VALUES ($1,$2,$3,$4,$5,ST_GeomFromEWKT($6),$7,$8,$9)`,
+      [PARCEL_ID, newParcel.properties.ulpin, newParcel.properties.ulpin3d,
+        newParcel.properties.ulpin14, newParcel.properties.ulpin14_source,
+        ring2d(footprintRing),
         newParcel.properties.area_m2, newParcel.properties.owner, projectId],
     );
 
     const bp = newBuilding.properties;
     await client.query(
-      `INSERT INTO building (id, parcel_id, ulpin, footprint, height_m, floors,
+      `INSERT INTO building (id, parcel_id, ulpin, ulpin3d, footprint, height_m, floors,
                              basements, ground_elev, use_type, height_source,
                              survey_synthetic, osm_id, name, address, project_id,
                              ground_source, flood_risk, cyclone_risk,
                              flood_score, cyclone_score, coast_dist_m,
                              local_relief_m)
-       VALUES ($1,$2,$3,ST_GeomFromEWKT($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-               $17,$18,$19,$20,$21,$22)`,
-      [BUILDING_ID, PARCEL_ID, bp.ulpin, ring2d(footprintRing), bp.height_m,
+       VALUES ($1,$2,$3,$4,ST_GeomFromEWKT($5),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+               $18,$19,$20,$21,$22,$23)`,
+      [BUILDING_ID, PARCEL_ID, bp.ulpin, bp.ulpin3d, ring2d(footprintRing), bp.height_m,
         bp.floors, bp.basements, bp.ground_elev, bp.use_type, bp.height_source,
         bp.survey_synthetic, bp.osm_id, bp.name, bp.address, projectId,
         bp.ground_source, bp.flood_risk, bp.cyclone_risk, bp.flood_score,
@@ -1280,10 +1364,10 @@ async function seedPostgis() {
       await client.query(
         // floor.geom is a PolyhedralSurfaceZ too: a storey is the solid
         // between its two heights, not a flat plate.
-        `INSERT INTO floor (id, building_id, ulpin, level_no, z_min, z_max,
+        `INSERT INTO floor (id, building_id, ulpin, ulpin3d, level_no, z_min, z_max,
                             geom, detect_source)
-         VALUES ($1,$2,$3,$4,$5,$6,make_prism(ST_GeomFromEWKT($7),$5,$6),$8)`,
-        [f.id, BUILDING_ID, f.ulpin, f.level_no, f.z_min, f.z_max,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,make_prism(ST_GeomFromEWKT($8),$6,$7),$9)`,
+        [f.id, BUILDING_ID, f.ulpin, f.ulpin3d, f.level_no, f.z_min, f.z_max,
           ring2d(footprintRing), f.detect_source],
       );
     }
@@ -1296,13 +1380,13 @@ async function seedPostgis() {
       // flats are the same kind of solid as the rest of the cadastre, so the
       // 3D conflict tests treat them identically.
       await client.query(
-        `INSERT INTO unit (id, floor_id, ulpin, unit_no, geom_3d, z_min, z_max,
+        `INSERT INTO unit (id, floor_id, ulpin, ulpin3d, unit_no, geom_3d, z_min, z_max,
                            carpet_m2, built_m2, tenure, encumbrance,
                            owner, address, facing, kind, core_ref, label)
-         VALUES ($1,$2,$3,$4,
-                 make_prism(ST_GeomFromEWKT($5), $6, $7),
-                 $6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-        [u.id, u.floor_id, dbUlpin(u), u.unit_no,
+         VALUES ($1,$2,$3,$4,$5,
+                 make_prism(ST_GeomFromEWKT($6), $7, $8),
+                 $7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        [u.id, u.floor_id, dbUlpin(u), u.ulpin3d ?? null, u.unit_no,
           ring2d(u.ring.coordinates[0]), u.z_min, u.z_max,
           // A volume without an identity has no areas or tenure in the
           // snapshot; the columns are NOT NULL here, so the enclosed area and

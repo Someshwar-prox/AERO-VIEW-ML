@@ -35,8 +35,10 @@ export interface DeedBounds {
 }
 
 export interface DeedDoc {
-  /** The identifier the deed is FOR. Absent only on a redacted unit. */
+  /** The identifier the deed is FOR -- the 3D ULPIN where one has been minted. Absent only on a redacted unit. */
   ulpin?: string;
+  /** The pre-3D-ULPIN identifier this same volume used to carry, if different. */
+  legacy_id?: string;
   /** 'Flat 901', 'Shop G-03', 'Parking Slot P-101'. */
   title: string;
   /** 'Titled unit', 'Appurtenant space', 'Structural core'. */
@@ -205,15 +207,16 @@ export function buildDeed(input: DeedInput): DeedDoc | null {
   const b = detail.building;
 
   return {
-    ulpin: unit.ulpin,
+    ulpin: unit.ulpin3d ?? unit.ulpin,
+    legacy_id: unit.ulpin3d ? unit.ulpin : undefined,
     title: input.title,
     kicker: input.kicker,
     kind: unit.kind ?? 'flat',
     titled: input.titled,
 
     building_name: b.name ?? `Building ${b.id}`,
-    building_ulpin: b.ulpin,
-    parcel_ulpin: detail.parcel?.ulpin,
+    building_ulpin: b.ulpin3d ?? b.ulpin,
+    parcel_ulpin: detail.parcel?.ulpin3d ?? detail.parcel?.ulpin,
     address: unit.address ?? b.address ?? undefined,
     level_label: levelLabel(unit.level_no, b.floors - 1),
 
@@ -264,7 +267,7 @@ export function buildDeed(input: DeedInput): DeedDoc | null {
     // identifier to address -- which buildDeed refuses to issue anyway, so
     // this is the second gate agreeing with the first.
     api_url: unit.ulpin
-      ? `${origin.replace(/\/+$/, '')}/api/v1/ladm/parcel/${unit.ulpin}`
+      ? `${origin.replace(/\/+$/, '')}/api/v1/ladm/parcel/${unit.ulpin3d ?? unit.ulpin}`
       : `${origin.replace(/\/+$/, '')}/api/p/${slug}/building/${b.id}`,
     datum_note: input.datumNote,
     ...(input.ladm ? { ladm: deedLadmOf(input.ladm) } : {}),
@@ -306,6 +309,7 @@ export function deedRows(d: DeedDoc): [string, string][] {
     if (v !== undefined && v !== null && v !== '') rows.push([k, v]);
   };
   push('3D ULPIN', d.ulpin);
+  push('Formerly', d.legacy_id);
   push('Description', d.kicker);
   push('Building', `${d.building_name} (${d.building_ulpin})`);
   push('Parcel', d.parcel_ulpin);
