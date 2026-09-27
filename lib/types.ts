@@ -80,6 +80,18 @@ export interface Ring {
 export interface BuildingProps {
   id: number;
   ulpin: string;
+  /** The new 3D ULPIN (parcel/B../level/unit/check). Absent until re-seeded. */
+  ulpin3d?: string;
+  /** Always equal to `ulpin` -- a GENERATED column, exposed under its own name. */
+  legacy_id?: string;
+  /**
+   * Whether this row (or one of its 3D-ULPIN descendants) has been retired by
+   * a split/merge -- see ulpin_lineage. NAMED `lineage_status`, not `status`,
+   * because `BuildingProps` is extended by `EnrichedBuilding` below, whose own
+   * `status: BuildingStatus` is an unrelated OCCUPANCY status ('Occupied' etc)
+   * that already owns the plain name.
+   */
+  lineage_status?: 'active' | 'retired';
   parcel_id: number;
   height_m: number;
   floors: number;
@@ -113,6 +125,11 @@ export interface BuildingProps {
 export interface ParcelInfo {
   id: number;
   ulpin: string;
+  ulpin3d?: string;
+  /** 14-char synthetic parcel identifier: state(2) + district(2) + geohash10. */
+  ulpin14?: string;
+  ulpin14_source?: 'synthetic' | 'official';
+  legacy_id?: string;
   area_m2: number;
   owner: string;
   geometry?: Ring;
@@ -138,6 +155,10 @@ export interface SurveyParcelProps {
   lpm_no: string | null;
   /** The real 14-digit Bhu-Aadhaar, when one exists. Never generated here. */
   ulpin_14: string | null;
+  /** This application's own synthetic 3D ULPIN for the survey parcel, from its own centroid. */
+  ulpin3d?: string;
+  ulpin14?: string;
+  ulpin14_source?: 'synthetic' | 'official';
   extent_sqm: number;
   classification: string | null;
   provenance: Provenance2D;
@@ -189,6 +210,9 @@ export interface SurveyParcelDetail {
 export interface FloorInfo {
   id: number;
   ulpin: string;
+  ulpin3d?: string;
+  legacy_id?: string;
+  vertical_datum?: string;
   level_no: number;
   z_min: number;
   z_max: number;
@@ -243,6 +267,9 @@ export interface UnitInfo {
    */
   restricted?: boolean;
   ulpin?: string;
+  ulpin3d?: string;
+  legacy_id?: string;
+  vertical_datum?: string;
   carpet_m2?: number;
   built_m2?: number;
   tenure?: string;
@@ -397,6 +424,11 @@ export interface UtilityProps {
   authority: string;
   status: string;
   in_conflict: boolean;
+  vertical_datum?: string;
+  /** The INF-rooted identifier, minted only for cross-parcel corridor types (not 'foundation'). */
+  infra_id?: string;
+  infra_type?: string;
+  infra_serial?: number;
   /** Set on a run that belongs to one building rather than to a street. */
   building_id?: number;
   /** Display identifier, e.g. "VSKP-WTR-004". Falls back to `#id`. */
@@ -431,9 +463,11 @@ export interface ConflictRow {
   depth_m: number;
   floor_id: number;
   floor_ulpin: string;
+  floor_ulpin3d?: string;
   level_no: number;
   building_id: number;
   building_ulpin: string;
+  building_ulpin3d?: string;
   building_name: string | null;
 }
 
@@ -457,6 +491,8 @@ export interface StackHit {
    */
   building_id: number | null;
   ulpin: string;
+  ulpin3d?: string;
+  legacy_id?: string;
   label: string;
   z_min: number | null;
   z_max: number | null;

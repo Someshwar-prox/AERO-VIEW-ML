@@ -221,7 +221,9 @@ console.log('\n[4] Deed export');
     note.includes('EGM96') && note.includes('-72.14'));
 
   const samples = [
-    ['flat', tower.units.find((u) => u.kind === 'flat'), tower, true],
+    // A flat's row carries no `kind` at all (see the identical note at the
+    // UI click-through test below) -- undefined means flat too.
+    ['flat', tower.units.find((u) => u.kind === 'flat' || u.kind === undefined), tower, true],
     ['parking bay', tower.units.find((u) => u.kind === 'parking'), tower, false],
     ['shop', mall.units.find((u) => u.kind === 'retail'), mall, true],
     ['anchor store', mall.units.find((u) => u.kind === 'anchor'), mall, true],
@@ -244,8 +246,11 @@ console.log('\n[4] Deed export');
       /Not an official government identifier/.test(deed.disclaimer));
     check(`deed: ${label} states its provenance`,
       typeof deed.provenance === 'string' && deed.provenance.length > 20);
+    // The deed prints ulpin3d (the new 3D ULPIN) as the identifier and
+    // points its QR there once one has been minted; a unit not yet re-seeded
+    // under the new scheme still falls back to its legacy ulpin.
     check(`deed: ${label} QR targets the live LADM record`,
-      deed.api_url.endsWith(`/api/v1/ladm/parcel/${unit.ulpin}`), deed.api_url);
+      deed.api_url.endsWith(`/api/v1/ladm/parcel/${unit.ulpin3d ?? unit.ulpin}`), deed.api_url);
     if (!titled) {
       check(`deed: ${label} invents no holder`, deed.owner === undefined);
     }
@@ -392,7 +397,10 @@ try {
   // but styled as muted text with no border or fill in the panel header, so it
   // read as a caption and was reported as missing by someone looking at it.
   // Presence alone is not enough -- it has to look like a control.
-  const flat = tower.units.find((u) => u.kind === 'flat');
+  // A flat's row carries no `kind` at all (the column default, 'flat', is
+  // never spelled out in the snapshot) -- so `undefined` means flat too, the
+  // same convention every reader of this field already applies elsewhere.
+  const flat = tower.units.find((u) => u.kind === 'flat' || u.kind === undefined);
   await page.goto(`${ORIGIN}/p/${SLUG}?b=${TOWER}&f=1&unit=${flat.id}`, {
     waitUntil: 'domcontentloaded', timeout: 90000,
   });

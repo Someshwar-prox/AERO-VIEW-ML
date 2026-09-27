@@ -223,13 +223,19 @@ SELECT cluster_id,
           + (SELECT parcel_off FROM seed_ctx))::int AS pid
 FROM p_norm;
 
-INSERT INTO parcel (id, project_id, ulpin, geom, area_m2, owner)
+INSERT INTO parcel (id, project_id, ulpin, ulpin14, ulpin3d, geom, area_m2, owner)
 SELECT s.pid,
        (SELECT project_id FROM seed_ctx),
        ulpin_fmt(s.pno, NULL, NULL, NULL,
                  (SELECT state_code    FROM seed_ctx),
                  (SELECT district_code FROM seed_ctx),
                  (SELECT scheme_code   FROM seed_ctx)),
+       ulpin3d_mint14((SELECT state_code FROM seed_ctx), (SELECT district_code FROM seed_ctx),
+                       ST_X(ST_Transform(ST_Centroid(p.parcel_utm), 4326)),
+                       ST_Y(ST_Transform(ST_Centroid(p.parcel_utm), 4326))),
+       ulpin3d_fmt(ulpin3d_mint14((SELECT state_code FROM seed_ctx), (SELECT district_code FROM seed_ctx),
+                       ST_X(ST_Transform(ST_Centroid(p.parcel_utm), 4326)),
+                       ST_Y(ST_Transform(ST_Centroid(p.parcel_utm), 4326)))),
        ST_Transform(p.parcel_utm, 4326),
        round(ST_Area(p.parcel_utm)::numeric, 2),
        (ARRAY['A. Lakshmi','B. V. Ramana','CH. Padmavathi','D. Suryanarayana',
@@ -252,7 +258,7 @@ SELECT b.osm_id,
           + (SELECT building_off FROM seed_ctx))::int                                AS bid
 FROM b_norm b JOIN parcel_seq s USING (cluster_id);
 
-INSERT INTO building (id, project_id, parcel_id, ulpin, footprint, height_m, floors,
+INSERT INTO building (id, project_id, parcel_id, ulpin, ulpin3d, footprint, height_m, floors,
                       basements, ground_elev, ground_source, use_type, height_source,
                       survey_synthetic, osm_id, name, address,
                       flood_risk, cyclone_risk, flood_score, cyclone_score,
@@ -264,6 +270,7 @@ SELECT q.bid,
                  (SELECT state_code    FROM seed_ctx),
                  (SELECT district_code FROM seed_ctx),
                  (SELECT scheme_code   FROM seed_ctx)),
+       ulpin3d_fmt(pcl.ulpin14, q.bno),
        b.geom4326,
        (b.props ->> 'height_m')::double precision,
        (b.props ->> 'floors')::int,
@@ -282,12 +289,13 @@ SELECT q.bid,
        (b.props ->> 'cyclone_score')::double precision,
        (b.props ->> 'coast_dist_m')::double precision,
        (b.props ->> 'local_relief_m')::double precision
-FROM b_norm b JOIN building_seq q USING (osm_id);
+FROM b_norm b JOIN building_seq q USING (osm_id)
+              JOIN parcel pcl ON pcl.id = q.pid;
 
 -- ---------------------------------------------------------------------------
 -- 5. floor rows -- one slab per level, basements below ground_elev
 -- ---------------------------------------------------------------------------
-INSERT INTO floor (id, building_id, ulpin, level_no, z_min, z_max, geom, detect_source)
+INSERT INTO floor (id, building_id, ulpin, ulpin3d, level_no, z_min, z_max, geom, detect_source)
 SELECT (row_number() OVER (ORDER BY b.id, lvl)
           + (SELECT floor_off FROM seed_ctx))::int,
        b.id,
@@ -295,6 +303,9 @@ SELECT (row_number() OVER (ORDER BY b.id, lvl)
                  (SELECT state_code    FROM seed_ctx),
                  (SELECT district_code FROM seed_ctx),
                  (SELECT scheme_code   FROM seed_ctx)),
+       ulpin3d_fmt(pcl.ulpin14, bs.bno,
+                   CASE WHEN lvl = 0 THEN 'ground' WHEN lvl > 0 THEN 'floor' ELSE 'basement' END,
+                   CASE WHEN lvl = 0 THEN NULL ELSE abs(lvl) END),
        lvl,
        b.ground_elev + lvl * 3.2,
        b.ground_elev + lvl * 3.2 + 3.2,
@@ -302,6 +313,7 @@ SELECT (row_number() OVER (ORDER BY b.id, lvl)
        b.height_source
 FROM building b
 JOIN building_seq bs ON bs.bid = b.id
+JOIN parcel pcl       ON pcl.id = b.parcel_id
 CROSS JOIN LATERAL generate_series(-b.basements, b.floors - 1) AS lvl
 WHERE b.project_id = (SELECT project_id FROM seed_ctx)
   AND make_prism(b.footprint, b.ground_elev + lvl * 3.2, b.ground_elev + lvl * 3.2 + 3.2) IS NOT NULL;
@@ -312,12 +324,13 @@ WHERE b.project_id = (SELECT project_id FROM seed_ctx)
 -- ---------------------------------------------------------------------------
 WITH g AS (
   SELECT f.id AS floor_id, f.level_no, f.z_min, f.z_max,
-         bs.pno, bs.bno,
+         bs.pno, bs.bno, pcl.ulpin14,
          (row_number() OVER (PARTITION BY f.id))::int AS idx,
          c.cell
   FROM floor f
   JOIN building b     ON b.id = f.building_id
   JOIN building_seq bs ON bs.bid = b.id
+  JOIN parcel pcl      ON pcl.id = b.parcel_id
   CROSS JOIN LATERAL unit_cells(
         ST_Transform(b.footprint, 32644),
         CASE WHEN b.use_type = 'residential' THEN 2 ELSE 3 END,
@@ -330,7 +343,7 @@ g_prism AS (
          make_prism(ST_Transform(g.cell, 4326), g.z_min + 0.15, g.z_max - 0.35) AS geom_3d
   FROM g
 )
-INSERT INTO unit (id, floor_id, ulpin, unit_no, geom_3d, z_min, z_max,
+INSERT INTO unit (id, floor_id, ulpin, ulpin3d, unit_no, geom_3d, z_min, z_max,
                   carpet_m2, built_m2, tenure, encumbrance)
 SELECT (row_number() OVER (ORDER BY g.floor_id, g.idx)
           + (SELECT unit_off FROM seed_ctx))::int,
@@ -339,6 +352,10 @@ SELECT (row_number() OVER (ORDER BY g.floor_id, g.idx)
                  (SELECT state_code    FROM seed_ctx),
                  (SELECT district_code FROM seed_ctx),
                  (SELECT scheme_code   FROM seed_ctx)),
+       ulpin3d_fmt(g.ulpin14, g.bno,
+                   CASE WHEN g.level_no = 0 THEN 'ground' ELSE 'floor' END,
+                   CASE WHEN g.level_no = 0 THEN NULL ELSE g.level_no END,
+                   'unit', g.idx),
        chr(65 + ((g.level_no)::int % 26)) || lpad(g.idx::text, 2, '0'),
        g.geom_3d,
        g.z_min + 0.15,
@@ -354,6 +371,33 @@ SELECT (row_number() OVER (ORDER BY g.floor_id, g.idx)
             ELSE 'None' END
 FROM g_prism g
 WHERE g.geom_3d IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 7. air_rights_volume -- ONE demonstration volume per project, on the parcel
+--    holding the tallest building, to prove the LEVEL=X branch of the 3D
+--    ULPIN grammar end to end. Deliberately illustrative: a flat 20 m buffer
+--    above the roof, NOT a real permitted-envelope calculation -- provenance
+--    stays 'estimated' and the note says so.
+-- ---------------------------------------------------------------------------
+DELETE FROM air_rights_volume WHERE project_id = (SELECT project_id FROM seed_ctx);
+
+INSERT INTO air_rights_volume (id, project_id, parcel_id, index_no, z_min, z_max,
+                                vertical_datum, ulpin3d, provenance, note)
+SELECT (SELECT COALESCE(max(id), 0) FROM air_rights_volume) + 1,
+       (SELECT project_id FROM seed_ctx),
+       b.parcel_id,
+       1,
+       b.ground_elev + b.height_m,
+       b.ground_elev + b.height_m + 20.0,
+       'placeholder',
+       ulpin3d_fmt(pcl.ulpin14, NULL, 'air_rights', 1),
+       'estimated',
+       'Illustrative permitted-envelope buffer above the tallest building on this parcel -- not a zoning calculation.'
+  FROM building b
+  JOIN parcel pcl ON pcl.id = b.parcel_id
+ WHERE b.project_id = (SELECT project_id FROM seed_ctx)
+ ORDER BY b.height_m DESC
+ LIMIT 1;
 
 COMMIT;
 
@@ -371,7 +415,9 @@ UNION ALL SELECT 'floors', count(*) FROM floor f
 UNION ALL SELECT 'units', count(*) FROM unit u
  JOIN floor f2 ON f2.id = u.floor_id
  JOIN building b2 ON b2.id = f2.building_id
- WHERE b2.project_id = (SELECT project_id FROM seed_ctx);
+ WHERE b2.project_id = (SELECT project_id FROM seed_ctx)
+UNION ALL SELECT 'air_rights_volumes', count(*) FROM air_rights_volume
+ WHERE project_id = (SELECT project_id FROM seed_ctx);
 
 SELECT height_source, count(*) FROM building
  WHERE project_id = (SELECT project_id FROM seed_ctx)

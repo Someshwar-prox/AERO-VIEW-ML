@@ -45,7 +45,8 @@ SELECT json_build_object(
     'type','Feature', 'id', b.id,
     'geometry', ST_AsGeoJSON(b.footprint, 7)::json,
     'properties', json_build_object(
-      'id', b.id, 'ulpin', b.ulpin, 'parcel_id', b.parcel_id,
+      'id', b.id, 'ulpin', b.ulpin, 'ulpin3d', b.ulpin3d, 'legacy_id', b.legacy_id,
+      'lineage_status', b.status, 'parcel_id', b.parcel_id,
       'height_m', b.height_m, 'floors', b.floors, 'basements', b.basements,
       'ground_elev', b.ground_elev, 'ground_source', b.ground_source, 'use_type', b.use_type,
       'flood_risk', b.flood_risk, 'cyclone_risk', b.cyclone_risk,
@@ -63,8 +64,30 @@ SELECT json_build_object(
     'type','Feature', 'id', p.id,
     'geometry', ST_AsGeoJSON(p.geom, 7)::json,
     'properties', json_build_object(
-      'id', p.id, 'ulpin', p.ulpin, 'area_m2', p.area_m2, 'owner', p.owner))), '[]'::json))
+      'id', p.id, 'ulpin', p.ulpin, 'ulpin3d', p.ulpin3d, 'ulpin14', p.ulpin14,
+      'ulpin14_source', p.ulpin14_source, 'legacy_id', p.legacy_id, 'status', p.status,
+      'area_m2', p.area_m2, 'owner', p.owner))), '[]'::json))
 FROM parcel p WHERE p.project_id = {SCOPE};
+"""
+
+AIR_RIGHTS = f"""
+SELECT COALESCE(json_agg(json_build_object(
+  'id', a.id, 'parcel_id', a.parcel_id, 'index_no', a.index_no,
+  'ulpin3d', a.ulpin3d, 'z_min', a.z_min, 'z_max', a.z_max,
+  'vertical_datum', a.vertical_datum, 'provenance', a.provenance,
+  'status', a.status, 'note', a.note)
+  ORDER BY a.id), '[]'::json)
+FROM air_rights_volume a WHERE a.project_id = {SCOPE};
+"""
+
+INFRA_LINKS = f"""
+SELECT COALESCE(json_agg(json_build_object(
+  'infra_id', l.infra_id, 'ulpin14', l.ulpin14, 'rrr_type', l.rrr_type,
+  'z_min', l.z_min, 'z_max', l.z_max, 'vertical_datum', l.vertical_datum)
+  ORDER BY l.infra_id, l.ulpin14), '[]'::json)
+FROM infra_parcel_link l
+JOIN parcel p ON p.ulpin14 = l.ulpin14
+WHERE p.project_id = {SCOPE};
 """
 
 # All columns, plus the count of buildings standing on the parcel -- which the
@@ -108,6 +131,8 @@ SELECT json_build_object(
     'properties', json_build_object(
       'id', u.id, 'asset_type', u.asset_type, 'depth_m', u.depth_m,
       'radius_m', u.radius_m, 'authority', u.authority, 'status', u.status,
+      'vertical_datum', u.vertical_datum,
+      'infra_id', u.infra_id, 'infra_type', u.infra_type, 'infra_serial', u.infra_serial,
       'in_conflict', EXISTS (SELECT 1 FROM conflict c
                               WHERE c.a_type='utility' AND c.a_id = u.id)))), '[]'::json))
 FROM utility u WHERE u.project_id = {SCOPE};
@@ -217,8 +242,8 @@ SELECT COALESCE(json_agg(json_build_object(
   'id', c.id, 'kind', c.kind, 'detected_at', c.detected_at,
   'utility_id', u.id, 'asset_type', u.asset_type, 'authority', u.authority,
   'status', u.status, 'depth_m', u.depth_m,
-  'floor_id', f.id, 'floor_ulpin', f.ulpin, 'level_no', f.level_no,
-  'building_id', b.id, 'building_ulpin', b.ulpin, 'building_name', b.name)
+  'floor_id', f.id, 'floor_ulpin', f.ulpin, 'floor_ulpin3d', f.ulpin3d, 'level_no', f.level_no,
+  'building_id', b.id, 'building_ulpin', b.ulpin, 'building_ulpin3d', b.ulpin3d, 'building_name', b.name)
   ORDER BY c.id), '[]'::json)
 FROM conflict c
 JOIN utility u  ON u.id = c.a_id
@@ -231,7 +256,8 @@ DETAIL = f"""
 SELECT COALESCE(json_object_agg(s.id, s.doc), '{{}}'::json) FROM (
   SELECT b.id, json_build_object(
     'building', json_build_object(
-      'id', b.id, 'ulpin', b.ulpin, 'parcel_id', b.parcel_id,
+      'id', b.id, 'ulpin', b.ulpin, 'ulpin3d', b.ulpin3d, 'legacy_id', b.legacy_id,
+      'lineage_status', b.status, 'parcel_id', b.parcel_id,
       'height_m', b.height_m, 'floors', b.floors, 'basements', b.basements,
       'ground_elev', b.ground_elev, 'ground_source', b.ground_source, 'use_type', b.use_type,
       'flood_risk', b.flood_risk, 'cyclone_risk', b.cyclone_risk,
@@ -241,17 +267,21 @@ SELECT COALESCE(json_object_agg(s.id, s.doc), '{{}}'::json) FROM (
       'osm_id', b.osm_id,
       'footprint', ST_AsGeoJSON(b.footprint, 7)::json),
     'parcel', (SELECT json_build_object(
-        'id', p.id, 'ulpin', p.ulpin, 'area_m2', p.area_m2, 'owner', p.owner,
+        'id', p.id, 'ulpin', p.ulpin, 'ulpin3d', p.ulpin3d, 'ulpin14', p.ulpin14,
+        'ulpin14_source', p.ulpin14_source, 'legacy_id', p.legacy_id,
+        'area_m2', p.area_m2, 'owner', p.owner,
         'geometry', ST_AsGeoJSON(p.geom, 7)::json)
       FROM parcel p WHERE p.id = b.parcel_id),
     'floors', COALESCE((SELECT json_agg(json_build_object(
-        'id', f.id, 'ulpin', f.ulpin, 'level_no', f.level_no,
+        'id', f.id, 'ulpin', f.ulpin, 'ulpin3d', f.ulpin3d, 'legacy_id', f.legacy_id,
+        'level_no', f.level_no, 'vertical_datum', f.vertical_datum,
         'z_min', f.z_min, 'z_max', f.z_max, 'detect_source', f.detect_source,
         'ring', ST_AsGeoJSON(ST_Force2D(b.footprint), 7)::json)
         ORDER BY f.level_no)
       FROM floor f WHERE f.building_id = b.id), '[]'::json),
     'units', COALESCE((SELECT json_agg(json_build_object(
         'id', un.id, 'floor_id', un.floor_id, 'ulpin', un.ulpin,
+        'ulpin3d', un.ulpin3d, 'legacy_id', un.legacy_id, 'vertical_datum', un.vertical_datum,
         'unit_no', un.unit_no, 'z_min', un.z_min, 'z_max', un.z_max,
         'carpet_m2', un.carpet_m2, 'built_m2', un.built_m2,
         'tenure', un.tenure, 'encumbrance', un.encumbrance,
@@ -296,6 +326,27 @@ FROM projects p;
 """
 
 STATS = f"""
+SELECT json_build_object(
+  'buildings', (SELECT count(*) FROM building WHERE project_id = {SCOPE}),
+  'parcels',   (SELECT count(*) FROM parcel   WHERE project_id = {SCOPE}),
+  'survey_parcels', (SELECT count(*) FROM survey_parcel WHERE project_id = {SCOPE}),
+  'floors',    (SELECT count(*) FROM floor f JOIN building b ON b.id = f.building_id
+                 WHERE b.project_id = {SCOPE}),
+  'units',     (SELECT count(*) FROM unit u JOIN floor f ON f.id = u.floor_id
+                 JOIN building b ON b.id = f.building_id
+                 WHERE b.project_id = {SCOPE}),
+  'utilities', (SELECT count(*) FROM utility WHERE project_id = {SCOPE}),
+  'conflicts', (SELECT count(*) FROM conflict c JOIN utility u ON u.id = c.a_id
+                 WHERE u.project_id = {SCOPE}),
+  'air_rights_volumes', (SELECT count(*) FROM air_rights_volume WHERE project_id = {SCOPE}),
+  'infra_parcel_links', (SELECT count(*) FROM infra_parcel_link l
+                          JOIN parcel p ON p.ulpin14 = l.ulpin14
+                          WHERE p.project_id = {SCOPE}));
+"""
+
+# Fallback for a volume that predates migration 002_ulpin3d (no
+# air_rights_volume / infra_parcel_link tables yet).
+STATS_LEGACY = f"""
 SELECT json_build_object(
   'buildings', (SELECT count(*) FROM building WHERE project_id = {SCOPE}),
   'parcels',   (SELECT count(*) FROM parcel   WHERE project_id = {SCOPE}),
@@ -360,8 +411,17 @@ def main():
         dump(out, "ladm.json", LADM)
     except Exception as exc:  # noqa: BLE001 -- see above
         print(f"  ladm.json         skipped ({exc})")
+    # Same guard: absent on a volume that predates migration 002_ulpin3d.
+    try:
+        dump(out, "air_rights.json", AIR_RIGHTS)
+        dump(out, "infra_links.json", INFRA_LINKS)
+    except Exception as exc:  # noqa: BLE001 -- see above
+        print(f"  air_rights.json / infra_links.json skipped ({exc})")
 
-    stats = json.loads(pg.scalar(STATS))
+    try:
+        stats = json.loads(pg.scalar(STATS))
+    except Exception:  # noqa: BLE001 -- volume predates migration 002_ulpin3d
+        stats = json.loads(pg.scalar(STATS_LEGACY))
     stats["streets"] = street_count(out)
     proj.write_stats(p, stats)
     # Only now: a project is 'ready' when there is something to read, not when

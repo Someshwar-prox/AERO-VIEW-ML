@@ -95,8 +95,9 @@ export function coerceEdit(
       errors.push({
         field: 'name',
         message: `"${key}" is not editable`
-          + (key === 'ulpin' || key === 'lat' || key === 'lon'
-            ? ' — coordinates and ULPIN are read-only.'
+          + (key === 'ulpin' || key === 'ulpin3d' || key === 'ulpin14' || key === 'legacy_id'
+              || key === 'lat' || key === 'lon'
+            ? ' — coordinates and every ULPIN (legacy or 3D) are read-only.'
             : '.'),
       });
       continue;

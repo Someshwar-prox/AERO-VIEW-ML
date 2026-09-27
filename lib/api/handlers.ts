@@ -3,12 +3,13 @@ import { callerTagFromCtx } from '@/lib/http/caller-tag';
 import {
   backend, getBuildingDetail, getBuildings, getLadmDoc, getParcels,
   getRoads, getSection22A, getSurveyParcelDetail, getSurveyParcels, getTopology,
-  getUtilities,
+  getUtilities, splitUnit,
 } from '@/lib/db';
 import { applyEdit, editsRev } from '@/lib/data/edits';
 import { coerceEdit, validateEdit, warningsFor } from '@/lib/data/building-schema';
 import { listProjects, resolveProject, unavailableMessage } from '@/lib/projects';
 import { CRS_2D, codesOfSuId, jsonLd } from '@/lib/ladm';
+import { decode3D, district2 } from '@/lib/ulpin';
 import type { LADMParcelDoc } from '@/lib/ladm';
 import { jsonPayload } from '@/lib/http/payload';
 import { warmProject } from '@/lib/server-cache';
@@ -832,6 +833,61 @@ export async function buildingPatchRoute(
 }
 
 /**
+ * POST .../unit/:id/split
+ *
+ * Demonstrates 3D-ULPIN persistence end to end: the unit is bisected, the
+ * parent is RETIRED (never deleted, never renumbered), two children mint
+ * fresh unit slots, and db/migrations/002_ulpin3d.sql's `ulpin_lineage`
+ * table records the parent -> children edge. Gov-only, and requires
+ * PostGIS -- see splitUnit() in lib/db.ts for why there is no snapshot-mode
+ * fallback.
+ */
+export async function unitSplitRoute(
+  slug: string, rawId: string, req: Request,
+): Promise<NextResponse> {
+  const id = parseEntityId(rawId);
+  if (id === null) {
+    return NextResponse.json({ error: 'id must be an integer' }, { status: 400 });
+  }
+  const ctx = await callerContext(req);
+  const mutationRefused = refuseMutation(ctx);
+  if (mutationRefused) return mutationRefused;
+  const projectGuard = enforceProjectAccess(ctx, slug);
+  if (projectGuard) return projectGuard;
+
+  const gate = await gateProject(slug);
+  if (gate) return gate;
+
+  const result = await splitUnit(slug, id);
+  if (!result.ok) {
+    if (result.reason === 'no-db') {
+      return NextResponse.json(
+        {
+          error: 'unit split requires a live database',
+          detail: 'This demo endpoint proves DB-backed 3D-ULPIN persistence '
+            + '(retire + mint + lineage), which a snapshot-only project has '
+            + 'no table to record. Configure DATABASE_URL and try again.',
+        },
+        { status: 503 },
+      );
+    }
+    if (result.reason === 'not-found') {
+      return NextResponse.json({ error: 'unit not found or already retired' }, { status: 404 });
+    }
+    return errorResponse('failed to split unit', new Error(result.message ?? 'unknown error'));
+  }
+
+  return NextResponse.json(
+    {
+      event: 'split',
+      parent: { ...result.parent, status: 'retired' },
+      children: result.children,
+    },
+    { status: 201, headers: await baseHeaders(slug) },
+  );
+}
+
+/**
  * POST .../query {lon, lat, z}
  * Every entity whose 3D volume contains the point, ordered
  * parcel < building < floor < unit.
@@ -984,11 +1040,15 @@ export async function ladmSpatialUnitRoute(
   slug: string, rawSuId: string, req: Request,
 ): Promise<NextResponse> {
   const suId = decodeURIComponent(rawSuId).trim().toUpperCase();
-  if (!codesOfSuId(suId)) {
+  // Accepts EITHER grammar: the new 3D ULPIN (what la_spatial_unit.su_id now
+  // prefers, once a project has re-seeded) or the legacy prefixed form
+  // (utility/air-rights su_ids, and any project not yet re-seeded).
+  if (!decode3D(suId) && !codesOfSuId(suId)) {
     return NextResponse.json(
       {
         error: 'not a spatial unit identifier',
-        detail: 'Expected <state>-<district>-<scheme>-... , e.g. '
+        detail: 'Expected a 3D ULPIN (e.g. TSHY4K7Q2M9RXP-B01-F05-012-Q) or the '
+          + 'legacy <state>-<district>-<scheme>-... form, e.g. '
           + 'AP-VSP-3D26-9999-001-09-901 or AP-VSP-3D26-UTL-00042.',
       },
       { status: 400 },
@@ -1092,12 +1152,27 @@ export async function ladmByIdentifierRoute(
   rawSuId: string, req: Request,
 ): Promise<NextResponse> {
   const suId = decodeURIComponent(rawSuId).trim().toUpperCase();
-  const codes = codesOfSuId(suId);
+
+  // Try the NEW 3D ULPIN grammar first -- it is what this application mints
+  // and displays going forward. Its ULPIN14 carries state(2) + district(2,
+  // truncated), not the old format's separate state-district-scheme groups,
+  // so project resolution matches on the truncated district too.
+  const parts3d = decode3D(suId);
+  let codes: { state: string; district: string; scheme?: string } | null = null;
+  if (parts3d) {
+    codes = { state: parts3d.ulpin14.slice(0, 2), district: parts3d.ulpin14.slice(2, 4) };
+  } else {
+    // Fall back to the OLD 7-group format, so an already-printed deed's QR
+    // code (which embeds the identifier that existed when it was issued)
+    // keeps resolving.
+    codes = codesOfSuId(suId);
+  }
   if (!codes) {
     return NextResponse.json(
       {
         error: 'not a spatial unit identifier',
-        detail: 'Expected <state>-<district>-<scheme>-... , e.g. '
+        detail: 'Expected a 3D ULPIN (e.g. TSHY4K7Q2M9RXP-B01-F05-012-Q) or the '
+          + 'legacy <state>-<district>-<scheme>-... form, e.g. '
           + 'AP-VSP-3D26-9999-001-09-901.',
       },
       { status: 400 },
@@ -1105,8 +1180,10 @@ export async function ladmByIdentifierRoute(
   }
   const projects = await listProjects();
   const match = projects.find((p) => p.state_code === codes.state
-    && p.district_code === codes.district
-    && p.scheme_code === codes.scheme);
+    && (codes.scheme === undefined || p.scheme_code === codes.scheme)
+    && (parts3d
+      ? district2(p.district_code) === codes.district
+      : p.district_code === codes.district));
   if (!match) {
     return NextResponse.json(
       {

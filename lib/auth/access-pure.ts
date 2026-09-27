@@ -14,7 +14,7 @@
  * session from the Next-managed cookie jar, which is a runtime
  * concern, not a rules concern.
  */
-import { parse } from '../ulpin.ts';
+import { decode3D, parse } from '../ulpin.ts';
 
 export type CallerContext =
   | { kind: 'gov' }
@@ -262,6 +262,24 @@ export function filterDetailForCaller<
  */
 export function ownsSpatialUnit(ctx: CallerContext, suId: string): boolean {
   if (ctx.kind !== 'citizen') return true;
+
+  // Try the NEW 3D ULPIN grammar first. A citizen session's `floor`/`unit`
+  // claims are minted under whichever format was current when they logged
+  // in, so this compares against BOTH the 3-digit slot decode3D() produces
+  // and the bare-numeral form, to tolerate either convention until every
+  // session claim is re-issued under the new format.
+  const parts3d = decode3D(suId);
+  if (parts3d) {
+    if (!parts3d.level || parts3d.unit === undefined) return false;
+    const floorNo = parts3d.level.kind === 'ground' ? 0
+      : parts3d.level.kind === 'floor' ? parts3d.level.n
+      : parts3d.level.kind === 'basement' ? -parts3d.level.n
+      : null; // air rights has no floor -- never a citizen's own unit
+    if (floorNo === null || floorNo !== ctx.floor) return false;
+    const bare = String(parts3d.unit.n);
+    return ctx.unit === bare || ctx.unit === bare.padStart(3, '0');
+  }
+
   const parts = parse(suId, 'any');
   if (!parts || parts.floor === undefined || parts.unitSlot === undefined) return false;
   return parts.floor === ctx.floor && parts.unitSlot === ctx.unit;

@@ -53,6 +53,11 @@ function isoDate(iso: string): string {
 export default function Section22ACard({ props }: { props: Section22AProps }) {
   const register = useDataStore((s) => s.section22a?.register ?? null);
   const buildings = useDataStore((s) => s.buildings);
+  const parcels = useDataStore((s) => s.parcels);
+  const parcel = useMemo(
+    () => parcels?.features.find((f) => f.properties.id === props.parcel_id) ?? null,
+    [parcels, props.parcel_id],
+  );
   const gis2d = useViewStore((s) => s.gis2d);
   const setActiveSurveyParcel = useViewStore((s) => s.setActiveSurveyParcel);
 
@@ -104,18 +109,22 @@ export default function Section22ACard({ props }: { props: Section22AProps }) {
       </p>
 
       {/* The parcel-level identifier, on the card that carries the disclaimer.
-          Built with generate() rather than concatenated, so it round-trips
-          through parse() by construction -- the property check_gis2d.mjs
-          already asserts for the survey card. Absent when the register brought
-          its own boundary and named no parcel of ours: there is then no
-          cadastre row for an identifier to describe. */}
+          Prefers the PARCEL ROW's own ulpin3d -- geometry-derived, so it
+          cannot be recomputed from the bare label the way the old identifier
+          can. generate() is the fallback when the parcel has not been
+          re-seeded under the new scheme yet, built rather than concatenated
+          so it round-trips through parse() by construction -- the property
+          check_gis2d.mjs already asserts for the survey card. Absent when the
+          register brought its own boundary and named no parcel of ours: there
+          is then no cadastre row for an identifier to describe. */}
       {props.parcel_label ? (
         <div className="mt-2">
           <UlpinCard
-            ulpin={generate(
+            ulpin={parcel?.properties.ulpin3d ?? generate(
               Number(props.parcel_label), undefined, undefined, undefined,
               codes ?? undefined,
             )}
+            ulpin14Source={parcel?.properties.ulpin14_source}
           />
         </div>
       ) : null}

@@ -449,7 +449,8 @@ function buildingsSql(scope: Scope) {
       'type','Feature','id',b.id,
       'geometry', ST_AsGeoJSON(b.footprint, 7)::json,
       'properties', json_build_object(
-        'id',b.id,'ulpin',b.ulpin,'parcel_id',b.parcel_id,
+        'id',b.id,'ulpin',b.ulpin,'ulpin3d',b.ulpin3d,'legacy_id',b.legacy_id,
+        'lineage_status',b.status,'parcel_id',b.parcel_id,
         'height_m',b.height_m,'floors',b.floors,'basements',b.basements,
         'ground_elev',b.ground_elev,'ground_source',b.ground_source,'use_type',b.use_type,
         'flood_risk',b.flood_risk,'cyclone_risk',b.cyclone_risk,
@@ -472,7 +473,9 @@ function parcelsSql(scope: Scope) {
       'type','Feature','id',p.id,
       'geometry', ST_AsGeoJSON(p.geom, 7)::json,
       'properties', json_build_object(
-        'id',p.id,'ulpin',p.ulpin,'area_m2',p.area_m2,'owner',p.owner))),'[]'::json)) AS fc
+        'id',p.id,'ulpin',p.ulpin,'ulpin3d',p.ulpin3d,'ulpin14',p.ulpin14,
+        'ulpin14_source',p.ulpin14_source,'legacy_id',p.legacy_id,
+        'area_m2',p.area_m2,'owner',p.owner))),'[]'::json)) AS fc
   FROM parcel p ${f.clause}`,
     params: f.params,
   };
@@ -499,6 +502,7 @@ function surveyParcelsSql(scope: Scope) {
       'properties', json_build_object(
         'id',sp.id,'label',sp.label,
         'ts_no',sp.ts_no,'lpm_no',sp.lpm_no,'ulpin_14',sp.ulpin_14,
+        'ulpin3d',sp.ulpin3d,'ulpin14',sp.ulpin14,'ulpin14_source',sp.ulpin14_source,
         'extent_sqm',sp.extent_sqm,'classification',sp.classification,
         'provenance',sp.provenance,'source',sp.source,
         'source_date', to_char(sp.source_date, 'YYYY-MM-DD'),
@@ -525,6 +529,8 @@ function utilitiesSql(scope: Scope) {
       'properties', json_build_object(
         'id',u.id,'asset_type',u.asset_type,'depth_m',u.depth_m,
         'radius_m',u.radius_m,'authority',u.authority,'status',u.status,
+        'vertical_datum',u.vertical_datum,
+        'infra_id',u.infra_id,'infra_type',u.infra_type,'infra_serial',u.infra_serial,
         -- Emitted so the PostGIS response carries the field the snapshot has
         -- always carried. Without it UtilitiesLayer laid the demo tower's
         -- riser out against the street datum on one backend and the
@@ -548,8 +554,8 @@ function conflictsSql(scope: Scope) {
     'id',c.id,'kind',c.kind,'detected_at',c.detected_at,
     'utility_id',u.id,'asset_type',u.asset_type,'authority',u.authority,
     'status',u.status,'depth_m',u.depth_m,
-    'floor_id',f.id,'floor_ulpin',f.ulpin,'level_no',f.level_no,
-    'building_id',b.id,'building_ulpin',b.ulpin,'building_name',b.name)
+    'floor_id',f.id,'floor_ulpin',f.ulpin,'floor_ulpin3d',f.ulpin3d,'level_no',f.level_no,
+    'building_id',b.id,'building_ulpin',b.ulpin,'building_ulpin3d',b.ulpin3d,'building_name',b.name)
     ORDER BY c.id),'[]'::json) AS rows
   FROM conflict c
   JOIN utility u  ON u.id = c.a_id
@@ -565,7 +571,8 @@ function detailSql(scope: Scope, id: number) {
     sql: `
   SELECT json_build_object(
     'building', json_build_object(
-      'id',b.id,'ulpin',b.ulpin,'parcel_id',b.parcel_id,'height_m',b.height_m,
+      'id',b.id,'ulpin',b.ulpin,'ulpin3d',b.ulpin3d,'legacy_id',b.legacy_id,
+      'lineage_status',b.status,'parcel_id',b.parcel_id,'height_m',b.height_m,
       'floors',b.floors,'basements',b.basements,'ground_elev',b.ground_elev,'ground_source',b.ground_source,
       'flood_risk',b.flood_risk,'cyclone_risk',b.cyclone_risk,
       'flood_score',b.flood_score,'cyclone_score',b.cyclone_score,
@@ -574,17 +581,20 @@ function detailSql(scope: Scope, id: number) {
       'address',b.address,'osm_id',b.osm_id,
       'footprint', ST_AsGeoJSON(b.footprint, 7)::json),
     'parcel', (SELECT json_build_object('id',p.id,'ulpin',p.ulpin,
+         'ulpin3d',p.ulpin3d,'ulpin14',p.ulpin14,'ulpin14_source',p.ulpin14_source,'legacy_id',p.legacy_id,
          'area_m2',p.area_m2,'owner',p.owner,
          'geometry', ST_AsGeoJSON(p.geom, 7)::json)
        FROM parcel p WHERE p.id = b.parcel_id),
     'floors', COALESCE((SELECT json_agg(json_build_object(
-         'id',f.id,'ulpin',f.ulpin,'level_no',f.level_no,'z_min',f.z_min,
+         'id',f.id,'ulpin',f.ulpin,'ulpin3d',f.ulpin3d,'legacy_id',f.legacy_id,
+         'vertical_datum',f.vertical_datum,'level_no',f.level_no,'z_min',f.z_min,
          'z_max',f.z_max,'detect_source',f.detect_source,
          'ring', ST_AsGeoJSON(ST_Force2D(b.footprint), 7)::json)
          ORDER BY f.level_no)
        FROM floor f WHERE f.building_id = b.id),'[]'::json),
     'units', COALESCE((SELECT json_agg(json_build_object(
-         'id',u.id,'floor_id',u.floor_id,'ulpin',u.ulpin,'unit_no',u.unit_no,
+         'id',u.id,'floor_id',u.floor_id,'ulpin',u.ulpin,'ulpin3d',u.ulpin3d,
+         'legacy_id',u.legacy_id,'vertical_datum',u.vertical_datum,'unit_no',u.unit_no,
          'z_min',u.z_min,'z_max',u.z_max,'carpet_m2',u.carpet_m2,
          'built_m2',u.built_m2,'tenure',u.tenure,'encumbrance',u.encumbrance,
          'owner',u.owner,'address',u.address,'facing',u.facing,
@@ -1120,6 +1130,51 @@ export async function getPristineConflicts(slug: string): Promise<ConflictRow[]>
   });
   if (r.ok) return r.value;
   return snapshot<ConflictRow[]>(slug, 'conflicts.json');
+}
+
+export type SplitUnitResult =
+  | { ok: true; parent: { id: number; ulpin3d: string }; children: { id: number; ulpin3d: string }[] }
+  | { ok: false; reason: 'no-db' | 'not-found' | 'error'; message?: string };
+
+/**
+ * Split a unit into two, proving 3D-ULPIN persistence: the parent is
+ * RETIRED, never deleted or renumbered, and the two children mint fresh
+ * unit slots via `unit_split()` (db/02_functions.sql), which does the actual
+ * geometry bisection and lineage bookkeeping in one transaction.
+ *
+ * REQUIRES POSTGIS. This is a demonstration of DB-backed persistence, not a
+ * general mutation the snapshot backend can also serve -- there is no
+ * parallel JS implementation, unlike every read path above, because there is
+ * nothing for a snapshot-only project to persist a split INTO.
+ */
+export async function splitUnit(slug: string, unitId: number): Promise<SplitUnitResult> {
+  const scope = await scopeFor(slug);
+  if (!scope) return { ok: false, reason: 'no-db' };
+  try {
+    const parentRows = await q<{ ulpin3d: string | null; ulpin: string }>(
+      'SELECT u.ulpin3d, u.ulpin FROM unit u '
+        + 'JOIN floor f ON f.id = u.floor_id JOIN building b ON b.id = f.building_id '
+        + 'WHERE u.id = $1 AND b.project_id = $2 AND u.status = \'active\'',
+      [unitId, scope.id],
+    );
+    if (!parentRows.length) return { ok: false, reason: 'not-found' };
+    const parentUlpin = parentRows[0].ulpin3d ?? parentRows[0].ulpin;
+
+    const rows = await q<{
+      child1_id: number; child1_ulpin3d: string; child2_id: number; child2_ulpin3d: string;
+    }>('SELECT * FROM unit_split($1)', [unitId]);
+    const row = rows[0];
+    return {
+      ok: true,
+      parent: { id: unitId, ulpin3d: parentUlpin },
+      children: [
+        { id: row.child1_id, ulpin3d: row.child1_ulpin3d },
+        { id: row.child2_id, ulpin3d: row.child2_ulpin3d },
+      ],
+    };
+  } catch (err) {
+    return { ok: false, reason: 'error', message: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**

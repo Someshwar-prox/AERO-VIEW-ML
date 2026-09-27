@@ -331,9 +331,13 @@ BEGIN
   -- Surface: the curtilage parcels, which carry a real ULPIN. 2D, because
   -- parcel.geom is a Polygon with no Z -- a plot's vertical extent is not
   -- recorded here, and writing 0 would be a claim that it has none.
+  --
+  -- COALESCE(p.ulpin3d, p.ulpin): a re-seeded project mints ulpin3d and this
+  -- picks it up automatically; a volume not yet re-seeded still has NULL
+  -- ulpin3d and this falls back to the legacy identifier exactly as before.
   INSERT INTO la_spatial_unit
     (su_id, project_id, source_kind, source_id, su_type, dimension, provenance)
-  SELECT p.ulpin, p_project_id, 'parcel', p.id, 'surface', '2D', 'derived'
+  SELECT COALESCE(p.ulpin3d, p.ulpin), p_project_id, 'parcel', p.id, 'surface', '2D', 'derived'
     FROM parcel p WHERE p.project_id = p_project_id;
 
   -- Surface, from the survey layer -- ONLY where a real survey record was
@@ -357,7 +361,7 @@ BEGIN
   INSERT INTO la_spatial_unit
     (su_id, project_id, source_kind, source_id, su_type, dimension,
      z_min, z_max, volume_m3, provenance)
-  SELECT u.ulpin, p_project_id, 'unit', u.id, 'multi_storey', '3D',
+  SELECT COALESCE(u.ulpin3d, u.ulpin), p_project_id, 'unit', u.id, 'multi_storey', '3D',
          u.z_min, u.z_max,
          -- Built area times clear height: the same figure the deed prints.
          u.built_m2 * (u.z_max - u.z_min),
@@ -399,6 +403,18 @@ BEGIN
          END
     FROM utility u WHERE u.project_id = p_project_id;
 
+  -- Air-rights volumes: attached to the parcel directly (no building), per
+  -- the 3D-ULPIN grammar's own X-level branch. Demonstration envelopes only
+  -- (see scripts/build_geometry.sql) -- provenance stays 'estimated' unless a
+  -- real permitted-envelope calculation is ever supplied.
+  INSERT INTO la_spatial_unit
+    (su_id, project_id, source_kind, source_id, su_type, dimension,
+     z_min, z_max, provenance)
+  SELECT a.ulpin3d, p_project_id, 'air_rights', a.id, 'air_rights', '3D',
+         a.z_min, a.z_max, a.provenance
+    FROM air_rights_volume a WHERE a.project_id = p_project_id
+  ON CONFLICT (source_kind, source_id) DO NOTHING;
+
   -- ------------------------------------------------------------ BA units
   -- One BA unit per titled volume, named for the volume itself.
   --
@@ -413,7 +429,7 @@ BEGIN
   -- an administrative record for a staircase would put a holder where the
   -- register has none.
   INSERT INTO la_ba_unit (project_id, ba_ulpin, name, ba_type)
-  SELECT p_project_id, u.ulpin || '-BA',
+  SELECT p_project_id, id3(u.ulpin3d, u.ulpin) || '-BA',
          COALESCE(u.label, initcap(u.kind) || ' ' || u.unit_no),
          'condominium_unit'
     FROM unit u
@@ -425,9 +441,9 @@ BEGIN
 
   -- The titled volume itself.
   INSERT INTO la_ba_unit_member (ba_unit_id, su_id, member_role, share_num, share_den)
-  SELECT ba.ba_unit_id, u.ulpin, 'principal', 1, 1
+  SELECT ba.ba_unit_id, id3(u.ulpin3d, u.ulpin), 'principal', 1, 1
     FROM la_ba_unit ba
-    JOIN unit u ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
    WHERE ba.project_id = p_project_id;
 
   -- One BA unit per surface plot that names a holder.
@@ -442,14 +458,15 @@ BEGIN
   -- 'basic_administrative_unit', not 'condominium_unit': the ground is held
   -- whole. Only the volumes stacked on it are condominium units.
   INSERT INTO la_ba_unit (project_id, ba_ulpin, name, ba_type)
-  SELECT p_project_id, p.ulpin || '-BA', 'Plot ' || p.ulpin, 'basic_administrative_unit'
+  SELECT p_project_id, id3(p.ulpin3d, p.ulpin) || '-BA',
+         'Plot ' || id3(p.ulpin3d, p.ulpin), 'basic_administrative_unit'
     FROM parcel p
    WHERE p.project_id = p_project_id AND p.owner IS NOT NULL AND p.owner <> '';
 
   INSERT INTO la_ba_unit_member (ba_unit_id, su_id, member_role, share_num, share_den)
-  SELECT ba.ba_unit_id, p.ulpin, 'principal', 1, 1
+  SELECT ba.ba_unit_id, id3(p.ulpin3d, p.ulpin), 'principal', 1, 1
     FROM la_ba_unit ba
-    JOIN parcel p ON p.ulpin || '-BA' = ba.ba_ulpin
+    JOIN parcel p ON id3(p.ulpin3d, p.ulpin) || '-BA' = ba.ba_ulpin
    WHERE ba.project_id = p_project_id;
 
   -- One BA unit per utility corridor.
@@ -480,9 +497,9 @@ BEGIN
   -- nothing and is left as an unattached spatial unit, which is the honest
   -- answer: the register does not say whose it is.
   INSERT INTO la_ba_unit_member (ba_unit_id, su_id, member_role, share_num, share_den)
-  SELECT DISTINCT ba.ba_unit_id, pu.ulpin, 'appurtenant', 1, 1
+  SELECT DISTINCT ba.ba_unit_id, id3(pu.ulpin3d, pu.ulpin), 'appurtenant', 1, 1
     FROM la_ba_unit ba
-    JOIN unit u   ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u   ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
     JOIN floor f  ON f.id = u.floor_id
     JOIN unit pu  ON pu.kind = 'parking' AND pu.owner = u.owner
     JOIN floor pf ON pf.id = pu.floor_id AND pf.building_id = f.building_id
@@ -498,9 +515,9 @@ BEGIN
   -- TypeScript so that "what fraction of the plot does this flat carry" is
   -- one join for every consumer.
   INSERT INTO la_ba_unit_member (ba_unit_id, su_id, member_role, share_num, share_den)
-  SELECT ba.ba_unit_id, p.ulpin, 'undivided_share', 1, cnt.n
+  SELECT ba.ba_unit_id, id3(p.ulpin3d, p.ulpin), 'undivided_share', 1, cnt.n
     FROM la_ba_unit ba
-    JOIN unit u    ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u    ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
     JOIN floor f   ON f.id = u.floor_id
     JOIN building b ON b.id = f.building_id
     JOIN parcel p  ON p.id = b.parcel_id
@@ -520,7 +537,7 @@ BEGIN
   INSERT INTO la_rrr (ba_unit_id, party_id, rrr_class, rrr_type, description)
   SELECT ba.ba_unit_id, pa.party_id, 'right', 'ownership', u.tenure
     FROM la_ba_unit ba
-    JOIN unit u ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
     JOIN la_party pa ON pa.project_id = p_project_id
                     AND pa.name = u.owner AND pa.role = 'owner'
    WHERE ba.project_id = p_project_id;
@@ -531,7 +548,7 @@ BEGIN
   INSERT INTO la_rrr (ba_unit_id, party_id, rrr_class, rrr_type)
   SELECT ba.ba_unit_id, pa.party_id, 'right', 'ownership'
     FROM la_ba_unit ba
-    JOIN parcel p ON p.ulpin || '-BA' = ba.ba_ulpin
+    JOIN parcel p ON id3(p.ulpin3d, p.ulpin) || '-BA' = ba.ba_ulpin
     JOIN la_party pa ON pa.project_id = p_project_id
                     AND pa.name = p.owner AND pa.role = 'owner'
    WHERE ba.project_id = p_project_id;
@@ -561,7 +578,7 @@ BEGIN
   INSERT INTO la_rrr (ba_unit_id, party_id, rrr_class, rrr_type, description)
   SELECT ba.ba_unit_id, pa.party_id, 'restriction', 'mortgage', u.encumbrance
     FROM la_ba_unit ba
-    JOIN unit u ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
     LEFT JOIN la_party pa ON pa.project_id = p_project_id
                          AND pa.role = 'bank'
                          AND pa.name = btrim(regexp_replace(u.encumbrance, '^Mortgage\s*[-·]\s*', ''))
@@ -573,11 +590,32 @@ BEGIN
   INSERT INTO la_rrr (ba_unit_id, rrr_class, rrr_type, description)
   SELECT ba.ba_unit_id, 'restriction', 'structural_restriction', u.encumbrance
     FROM la_ba_unit ba
-    JOIN unit u ON u.ulpin || '-BA' = ba.ba_ulpin
+    JOIN unit u ON id3(u.ulpin3d, u.ulpin) || '-BA' = ba.ba_ulpin
    WHERE ba.project_id = p_project_id
      AND u.encumbrance IS NOT NULL
      AND u.encumbrance <> 'None'
      AND u.encumbrance !~ '^Mortgage\s*[-·]';
+
+  -- The burden side of a cross-parcel infrastructure easement -- the parcel
+  -- is crossed under or over, and that is a restriction on ITS BA unit, not a
+  -- right of the operator's (which is recorded above, against the utility's
+  -- own BA unit). Only where the parcel names an owner: an unowned parcel has
+  -- no administrative record here to burden. 'easement' names an underground
+  -- crossing; an elevated/overhead one is recorded as a height restriction,
+  -- since the parcel's owner is not burdened with occupying ground so much as
+  -- with what they may build into the air above it.
+  INSERT INTO la_rrr (ba_unit_id, party_id, rrr_class, rrr_type, description)
+  SELECT ba.ba_unit_id, pa.party_id, 'restriction',
+         CASE WHEN l.rrr_type = 'easement' THEN 'easement' ELSE 'height_restriction' END,
+         'Infrastructure ' || l.infra_id || ', z ' || l.z_min::numeric(6,2)
+           || ' to ' || l.z_max::numeric(6,2) || ' m (' || l.vertical_datum || ')'
+    FROM infra_parcel_link l
+    JOIN parcel p ON p.project_id = p_project_id AND p.ulpin14 = l.ulpin14
+    JOIN la_ba_unit ba ON ba.ba_ulpin = id3(p.ulpin3d, p.ulpin) || '-BA'
+                      AND ba.project_id = p_project_id
+    LEFT JOIN utility u ON u.infra_id = l.infra_id AND u.project_id = p_project_id
+    LEFT JOIN la_party pa ON pa.project_id = p_project_id
+                         AND pa.name = u.authority AND pa.role = 'utility_operator';
 
   RETURN QUERY
     SELECT (SELECT count(*) FROM la_party        WHERE project_id = p_project_id),
@@ -587,3 +625,330 @@ BEGIN
              WHERE ba.project_id = p_project_id);
 END
 $$;
+
+
+-- ===========================================================================
+-- 3D ULPIN -- a true vertical extension of the 14-digit ULPIN (Bhu-Aadhaar).
+--
+--     <ULPIN14>[-B<bb>][-<LEVEL>][-<UNIT>]-<CHK>
+--     e.g.  TSHY4K7Q2M9RXP-B01-F05-012-Q
+--
+-- Sits ALONGSIDE ulpin_fmt()/ulpin_fmt_slot() above, which are untouched: every
+-- row keeps its old `ulpin` (exposed as `legacy_id`, see migration 002) and
+-- gains a new `ulpin3d`. Mirrored byte-for-byte in lib/ulpin.ts -- the pairing
+-- discipline this file has used since ulpin_fmt() itself.
+-- ===========================================================================
+
+-- Two-letter shorthand for a project's district code: 'VSP' -> 'VS'. Mirrors
+-- district2() in lib/ulpin.ts. Used both in ulpin14 and in infra_fmt(), so
+-- 'INF-AP-VS-...' and a Visakhapatnam parcel's ulpin14 agree on what "VS" is.
+CREATE OR REPLACE FUNCTION ulpin3d_district2(di text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+  SELECT upper(left(btrim(di), 2));
+$fn$;
+
+
+-- The identifier a row is addressed by: its new ulpin3d where one has been
+-- minted, its legacy ulpin otherwise. Used everywhere ladm_backfill() mints or
+-- joins an su_id/ba_ulpin from a parcel or unit row, so a project re-seeded
+-- under the 3D scheme picks it up automatically and one not yet re-seeded
+-- keeps behaving exactly as before.
+CREATE OR REPLACE FUNCTION id3(new_id text, old_id text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+  SELECT COALESCE(new_id, old_id);
+$fn$;
+
+
+-- Mint a synthetic ULPIN14 from a parcel centroid: 2-char state + 2-char
+-- district + a 10-character geohash of (lon, lat), uppercased. PostGIS's own
+-- ST_GeoHash is the reference implementation; lib/ulpin.ts's geohash()
+-- reimplements the same (unmodified) geohash.org algorithm so the two agree
+-- without either side reinventing the bit-interleave by hand.
+CREATE OR REPLACE FUNCTION ulpin3d_mint14(st text, di text,
+                                          lon double precision, lat double precision)
+RETURNS text
+LANGUAGE sql IMMUTABLE AS $fn$
+  SELECT upper(btrim(st)) || ulpin3d_district2(di)
+      || upper(ST_GeoHash(ST_SetSRID(ST_MakePoint(lon, lat), 4326), 10));
+$fn$;
+
+
+-- ISO 7064 MOD 37,36 (pure system) check character over an uppercase
+-- alphanumeric body with separators already stripped. Identical algorithm to
+-- checkChar3736() in lib/ulpin.ts -- see that function's comment for why the
+-- iterated "add, then multiply by the radix" step guarantees detection of
+-- every single-character substitution and adjacent transposition.
+CREATE OR REPLACE FUNCTION ulpin3d_check(body text) RETURNS char(1)
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+  alphabet       text := '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  check_alphabet text := '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ*';
+  m int := 37;
+  r int := 36;
+  p int := 37;
+  i int;
+  v int;
+  check_value int;
+BEGIN
+  FOR i IN 1..length(body) LOOP
+    v := position(upper(substr(body, i, 1)) IN alphabet) - 1;
+    IF v < 0 THEN
+      RAISE EXCEPTION 'ulpin3d_check: invalid character % in %', substr(body, i, 1), body;
+    END IF;
+    p := (p + v) % m;
+    IF p = 0 THEN p := m; END IF;
+    p := (p * r) % m;
+    IF p = 0 THEN p := m; END IF;
+  END LOOP;
+  check_value := (m + 1 - p) % m;
+  IF check_value = 0 THEN check_value := m; END IF;
+  RETURN substr(check_alphabet, check_value, 1);
+END
+$fn$;
+
+
+-- Build a full 3D ULPIN body + check character.
+--
+-- level_kind is one of 'ground','floor','basement','air_rights', matching
+-- lib/ulpin.ts's Ulpin3DLevel['kind']. An air-rights level attaches directly
+-- to the parcel and carries NO building segment -- the brief's own example is
+-- 'TSHY4K7Q2M9RXP-X01-8', not '...-B01-X01-...' -- so `building` is ignored
+-- whenever level_kind = 'air_rights'.
+--
+-- unit_kind is one of 'unit','parking','common', matching Ulpin3DUnitKind.
+CREATE OR REPLACE FUNCTION ulpin3d_fmt(ulpin14 text,
+                                       building int DEFAULT NULL,
+                                       level_kind text DEFAULT NULL,
+                                       level_n int DEFAULT NULL,
+                                       unit_kind text DEFAULT NULL,
+                                       unit_n int DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+  body text;
+  level_code text;
+  unit_slot3d text;
+BEGIN
+  IF level_kind = 'air_rights' THEN
+    body := upper(ulpin14) || '-X' || lpad(level_n::text, 2, '0');
+    RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+  END IF;
+
+  body := upper(ulpin14);
+  IF building IS NULL THEN
+    RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+  END IF;
+  body := body || '-B' || lpad(building::text, 2, '0');
+
+  IF level_kind IS NULL THEN
+    RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+  END IF;
+  level_code := CASE level_kind
+    WHEN 'ground'   THEN 'G00'
+    WHEN 'floor'    THEN 'F' || lpad(level_n::text, 2, '0')
+    WHEN 'basement' THEN 'D' || lpad(level_n::text, 2, '0')
+  END;
+  body := body || '-' || level_code;
+
+  IF unit_kind IS NULL THEN
+    RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+  END IF;
+  unit_slot3d := CASE unit_kind
+    WHEN 'unit'    THEN ''
+    WHEN 'parking' THEN 'PK'
+    WHEN 'common'  THEN 'CA'
+  END || lpad(unit_n::text, 3, '0');
+  body := body || '-' || unit_slot3d;
+
+  RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+END
+$fn$;
+
+
+-- Structural + check-character validity of a 3D ULPIN. Does not verify
+-- ulpin14 against any centroid -- that would need the parcel row, which a
+-- pure function does not have.
+CREATE OR REPLACE FUNCTION ulpin3d_valid(id text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+  body text;
+  chk  text;
+BEGIN
+  IF id IS NULL OR id !~ '^[A-Z0-9]{4,}(-[A-Z0-9]+)*-[0-9A-Z*]$' THEN RETURN false; END IF;
+  body := left(id, length(id) - 2);
+  chk  := right(id, 1);
+  BEGIN
+    RETURN ulpin3d_check(replace(body, '-', '')) = chk;
+  EXCEPTION WHEN OTHERS THEN
+    RETURN false;
+  END;
+END
+$fn$;
+
+
+-- ---------------------------------------------------------------------------
+-- Persistence: split a unit into two, proving IDs are never reused.
+--
+-- Bisects the unit's 2D plan footprint through its centroid, perpendicular to
+-- its oriented envelope's long axis -- the same "axis-align, then slice"
+-- approach unit_cells() in scripts/build_geometry.sql already uses, just for
+-- one existing polygon into two instead of a footprint into a grid. Each half
+-- becomes a NEW unit row with a freshly minted 3D-ULPIN unit slot; the parent
+-- is RETIRED (status='retired', retired_at=now()), never deleted and never
+-- reused, and ulpin_lineage records the parent -> children edge.
+--
+-- Demonstration geometry, like unit_cells(): a straight bisection is not a
+-- surveyed subdivision plan, which is why the two new rows keep the parent's
+-- tenure/encumbrance/owner rather than inventing new ones.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION unit_split(p_unit_id integer)
+RETURNS TABLE (child1_id integer, child1_ulpin3d text, child2_id integer, child2_ulpin3d text)
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  v_floor_id integer;
+  v_kind     text;
+  v_owner    text;
+  v_tenure   text;
+  v_encumbrance text;
+  v_z_min    double precision;
+  v_z_max    double precision;
+  v_plan     geometry;
+  v_ctr      geometry;
+  v_env      geometry;
+  v_ang      double precision;
+  v_split_line geometry;
+  v_pieces   geometry[];
+  v_level_no integer;
+  v_ulpin14  text;
+  v_bno      int;
+  v_kind3d   text;
+  v_slot_prefix text;
+  v_next     int;
+  v_new_id1  integer;
+  v_new_id2  integer;
+  v_ulpin3d_1 text;
+  v_ulpin3d_2 text;
+  v_carpet_total double precision;
+  v_built_total  double precision;
+BEGIN
+  SELECT u.floor_id, u.kind, u.owner, u.tenure, u.encumbrance, u.z_min, u.z_max,
+         ladm_plan_geom(u.geom_3d), u.carpet_m2, u.built_m2
+    INTO v_floor_id, v_kind, v_owner, v_tenure, v_encumbrance, v_z_min, v_z_max,
+         v_plan, v_carpet_total, v_built_total
+    FROM unit u WHERE u.id = p_unit_id AND u.status = 'active';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'unit_split: unit % not found or already retired', p_unit_id;
+  END IF;
+
+  SELECT f.level_no, p.ulpin14,
+         substring(b.ulpin3d from '-B(\d{2})')::int
+    INTO v_level_no, v_ulpin14, v_bno
+    FROM floor f
+    JOIN building b ON b.id = f.building_id
+    JOIN parcel p   ON p.id = b.parcel_id
+   WHERE f.id = v_floor_id;
+  IF v_ulpin14 IS NULL OR v_bno IS NULL THEN
+    RAISE EXCEPTION 'unit_split: unit % is on a building not yet minted under the 3D-ULPIN scheme', p_unit_id;
+  END IF;
+
+  v_kind3d := CASE WHEN v_kind = 'parking' THEN 'parking' WHEN v_kind IN ('flat','retail','anchor') THEN 'unit' ELSE 'common' END;
+  v_slot_prefix := CASE v_kind3d WHEN 'parking' THEN 'PK' WHEN 'common' THEN 'CA' ELSE '' END;
+
+  -- Bisect the plan footprint through its centroid, perpendicular to the
+  -- oriented envelope's long axis.
+  v_ctr := ST_Centroid(v_plan);
+  v_env := ST_OrientedEnvelope(v_plan);
+  v_ang := CASE WHEN v_env IS NULL OR ST_GeometryType(v_env) <> 'ST_Polygon' THEN 0
+                ELSE ST_Azimuth(ST_PointN(ST_ExteriorRing(v_env), 1), ST_PointN(ST_ExteriorRing(v_env), 2)) END;
+  v_split_line := ST_Rotate(
+    ST_MakeLine(ST_Translate(v_ctr, 0, -1000), ST_Translate(v_ctr, 0, 1000)),
+    v_ang, v_ctr);
+
+  SELECT array_agg(d.geom ORDER BY ST_XMin(d.geom))
+    INTO v_pieces
+    FROM (SELECT (ST_Dump(ST_Split(v_plan, v_split_line))).geom AS geom) d
+   WHERE ST_Area(d.geom) > 1.0;
+  IF v_pieces IS NULL OR array_length(v_pieces, 1) <> 2 THEN
+    RAISE EXCEPTION 'unit_split: could not bisect unit % into exactly two pieces', p_unit_id;
+  END IF;
+
+  -- Next free 3-digit ordinal(s) in this unit kind's namespace, on this
+  -- floor. Best-effort: scans existing (including retired) ulpin3d unit
+  -- slots on the floor so a re-split of an already-split floor still mints
+  -- fresh numbers rather than colliding.
+  SELECT COALESCE(max(
+           CASE WHEN v_slot_prefix = ''
+                THEN substring(u2.ulpin3d from '-(\d{3})-[0-9A-Z*]$')::int
+                ELSE substring(u2.ulpin3d from '-' || v_slot_prefix || '(\d{3})-[0-9A-Z*]$')::int
+           END), 0) + 1
+    INTO v_next
+    FROM unit u2 JOIN floor f2 ON f2.id = u2.floor_id
+   WHERE f2.id = v_floor_id;
+
+  v_new_id1 := (SELECT COALESCE(max(id), 0) FROM unit) + 1;
+  v_ulpin3d_1 := ulpin3d_fmt(v_ulpin14, v_bno,
+                CASE WHEN v_level_no = 0 THEN 'ground' WHEN v_level_no > 0 THEN 'floor' ELSE 'basement' END,
+                CASE WHEN v_level_no = 0 THEN NULL ELSE abs(v_level_no) END,
+                v_kind3d, v_next);
+  INSERT INTO unit (id, floor_id, ulpin, ulpin3d, unit_no, geom_3d, z_min, z_max,
+                    carpet_m2, built_m2, tenure, encumbrance, kind, owner)
+  VALUES (v_new_id1, v_floor_id,
+          -- The old-format `ulpin` column is NOT NULL; this row has no old
+          -- identifier of its own (it was born after the switch), so it
+          -- carries its OWN ulpin3d string there too, structurally distinct
+          -- from every real legacy ULPIN because it is far longer than
+          -- seven dash-separated groups -- never mistakeable for one.
+          v_ulpin3d_1, v_ulpin3d_1,
+          (SELECT unit_no FROM unit WHERE id = p_unit_id) || 'A',
+          make_prism(v_pieces[1], v_z_min, v_z_max), v_z_min, v_z_max,
+          round((v_carpet_total * ST_Area(v_pieces[1]) / ST_Area(v_plan))::numeric, 2),
+          round((v_built_total  * ST_Area(v_pieces[1]) / ST_Area(v_plan))::numeric, 2),
+          v_tenure, v_encumbrance, v_kind, v_owner);
+
+  v_new_id2 := v_new_id1 + 1;
+  v_ulpin3d_2 := ulpin3d_fmt(v_ulpin14, v_bno,
+                CASE WHEN v_level_no = 0 THEN 'ground' WHEN v_level_no > 0 THEN 'floor' ELSE 'basement' END,
+                CASE WHEN v_level_no = 0 THEN NULL ELSE abs(v_level_no) END,
+                v_kind3d, v_next + 1);
+  INSERT INTO unit (id, floor_id, ulpin, ulpin3d, unit_no, geom_3d, z_min, z_max,
+                    carpet_m2, built_m2, tenure, encumbrance, kind, owner)
+  VALUES (v_new_id2, v_floor_id, v_ulpin3d_2, v_ulpin3d_2,
+          (SELECT unit_no FROM unit WHERE id = p_unit_id) || 'B',
+          make_prism(v_pieces[2], v_z_min, v_z_max), v_z_min, v_z_max,
+          round((v_carpet_total * ST_Area(v_pieces[2]) / ST_Area(v_plan))::numeric, 2),
+          round((v_built_total  * ST_Area(v_pieces[2]) / ST_Area(v_plan))::numeric, 2),
+          v_tenure, v_encumbrance, v_kind, v_owner);
+
+  UPDATE unit SET status = 'retired', retired_at = now() WHERE id = p_unit_id;
+
+  INSERT INTO ulpin_lineage (project_id, parent_id, child_id, event)
+  SELECT b.project_id, COALESCE(u.ulpin3d, u.ulpin), x.child, 'split'
+    FROM unit u
+    JOIN floor f ON f.id = u.floor_id
+    JOIN building b ON b.id = f.building_id
+    CROSS JOIN LATERAL (VALUES (v_ulpin3d_1), (v_ulpin3d_2)) AS x(child)
+   WHERE u.id = p_unit_id;
+
+  RETURN QUERY SELECT v_new_id1, v_ulpin3d_1, v_new_id2, v_ulpin3d_2;
+END
+$fn$;
+
+
+-- INF-<ST>-<DT>-<TYPE><serial4>[-S<seg3>]-<CHK> -- the root for cross-parcel
+-- infrastructure (utility corridors, metro tunnels, elevated corridors), which
+-- is not anchored to any one parcel's ulpin14.
+CREATE OR REPLACE FUNCTION infra_fmt(st text, di text, itype text, serial int,
+                                     seg int DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+  body text;
+BEGIN
+  body := 'INF-' || upper(btrim(st)) || '-' || ulpin3d_district2(di) || '-'
+       || upper(itype) || lpad(serial::text, 4, '0');
+  IF seg IS NOT NULL THEN
+    body := body || '-S' || lpad(seg::text, 3, '0');
+  END IF;
+  RETURN body || '-' || ulpin3d_check(replace(body, '-', ''));
+END
+$fn$;
